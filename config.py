@@ -16,9 +16,9 @@ class Settings:
     GOOGLE_AUTH_URI: str = os.getenv("GOOGLE_AUTH_URI", "https://accounts.google.com/o/oauth2/auth")
     GOOGLE_TOKEN_URI: str = os.getenv("GOOGLE_TOKEN_URI", "https://oauth2.googleapis.com/token")
     GOOGLE_HEALTH_SCOPES: list = os.getenv("GOOGLE_HEALTH_SCOPES", "").split() or [
-        "https://www.googleapis.com/auth/fitness.sleep.read",
-        "https://www.googleapis.com/auth/fitness.activity.read",
-        "https://www.googleapis.com/auth/fitness.heart_rate.read",
+        "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
+        "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
+        "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
     ]
 
     # Claude API

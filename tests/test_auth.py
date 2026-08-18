@@ -3,6 +3,7 @@ Tests for Phase 2 OAuth 2.0 flow (routes/auth.py)
 Uses the configured DATABASE_URL directly; mocks calls to Google's token endpoint.
 """
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -11,10 +12,20 @@ from fastapi.testclient import TestClient
 from app import app
 from database import SessionLocal
 from models import User, OAuthToken
+from services.google_health import TokenBundle
 
 client = TestClient(app)
 
 TEST_CHAT_ID = "pytest_chat_id"
+
+
+def _fake_bundle(access_token="fake_access_token", refresh_token="fake_refresh_token"):
+    return TokenBundle(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        scope="",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -56,12 +67,8 @@ def test_callback_creates_user_and_token():
     state = start_oauth_flow()
 
     with patch(
-        "routes.auth.google_health_client.exchange_code_for_tokens",
-        new=AsyncMock(return_value={
-            "access_token": "fake_access_token",
-            "refresh_token": "fake_refresh_token",
-            "expires_in": 3600,
-        }),
+        "routes.auth.google_health_client.exchange_code",
+        new=AsyncMock(return_value=_fake_bundle()),
     ):
         response = client.get("/auth/callback", params={"code": "fakecode", "state": state})
 
@@ -92,12 +99,8 @@ def test_full_oauth_lifecycle():
     state = start_oauth_flow()
 
     with patch(
-        "routes.auth.google_health_client.exchange_code_for_tokens",
-        new=AsyncMock(return_value={
-            "access_token": "fake_access_token",
-            "refresh_token": "fake_refresh_token",
-            "expires_in": 3600,
-        }),
+        "routes.auth.google_health_client.exchange_code",
+        new=AsyncMock(return_value=_fake_bundle()),
     ):
         callback_response = client.get("/auth/callback", params={"code": "fakecode", "state": state})
     user_id = callback_response.json()["user_id"]
@@ -106,8 +109,8 @@ def test_full_oauth_lifecycle():
     assert status_response.json()["authenticated"] is True
 
     with patch(
-        "routes.auth.google_health_client.refresh_access_token",
-        new=AsyncMock(return_value={"access_token": "new_fake_token", "expires_in": 3600}),
+        "routes.auth.google_health_client.refresh",
+        new=AsyncMock(return_value=_fake_bundle(access_token="new_fake_token")),
     ):
         refresh_response = client.post("/auth/refresh-token", params={"user_id": user_id})
     assert refresh_response.status_code == 200
