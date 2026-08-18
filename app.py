@@ -18,8 +18,8 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
 # Import routers
-from routes import auth
-# from routes import telegram, health, mcp_tools
+from routes import auth, mcp_tools
+# from routes import telegram, health
 
 # Lifespan context for startup/shutdown
 @asynccontextmanager
@@ -70,9 +70,9 @@ async def root():
 
 # Include routers
 app.include_router(auth.router, prefix="/auth", tags=["authentication"])
+app.include_router(mcp_tools.router, prefix="/mcp", tags=["mcp"])
 # app.include_router(telegram.router, prefix="/webhook", tags=["telegram"])
 # app.include_router(health.router, prefix="/api/health", tags=["health"])
-# app.include_router(mcp_tools.router, prefix="/mcp", tags=["mcp"])
 
 if __name__ == "__main__":
     import uvicorn

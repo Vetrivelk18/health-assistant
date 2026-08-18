@@ -23,7 +23,7 @@ class Settings:
 
     # Claude API
     CLAUDE_API_KEY: str = os.getenv("CLAUDE_API_KEY")
-    CLAUDE_MODEL: str = "claude-3-5-sonnet-20241022"  # Latest Claude model
+    CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-opus-5")
 
     # Telegram
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN")

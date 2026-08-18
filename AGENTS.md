@@ -20,6 +20,22 @@ new `GoogleHealthClient` interface (constructor takes `client_id`/
 `exchange_code()`, `refresh()`, returning a `TokenBundle` instead of a raw
 dict) — `tests/test_auth.py` covers the OAuth routes and passes.
 
+`services/claude.py` (Claude tool-use loop) and `routes/mcp_tools.py`
+(`GET /mcp/tools`, `POST /mcp/query`) are built and wired into `app.py`.
+`services/claude.py` defines one tool, `get_health_metric`, that Claude calls
+to pull a Fitbit/Pixel Watch metric via `GoogleHealthClient.list_data_points`;
+`tests/test_mcp_tools.py` covers the routes with mocked Claude/Google calls.
+This required bumping `anthropic` in `requirements.txt` from `0.21.0` (too
+old to have a `tools` parameter on `messages.create` at all) to `0.69.0`, and
+changing `config.py`'s `CLAUDE_MODEL` default from the retired
+`claude-3-5-sonnet-20241022` to `claude-opus-5` (now `os.getenv`-overridable).
+
+`routes/telegram.py`, `routes/health.py`, `services/telegram_bot.py`, and
+`services/scheduler.py` — the pieces that would actually call `/mcp/query`
+from a real Telegram message and run the 7am daily summary — don't exist
+yet. `routes/mcp_tools.py` is directly testable via `POST /mcp/query` in the
+meantime.
+
 One thing still open:
 
 - The exact `filter` query grammar for `GET /v4/.../dataPoints` isn't fully
@@ -27,7 +43,9 @@ One thing still open:
   holds untested candidates; `FILTER_TEMPLATE_IN_USE` is `None` until one is
   confirmed working. Run `python3 probe_health_api.py` (standalone, no
   FastAPI/DB needed — see `README_PROBE.md`) against a real account to find
-  it, then set `FILTER_TEMPLATE_IN_USE`.
+  it, then set `FILTER_TEMPLATE_IN_USE`. Until then, `get_health_metric` tool
+  calls go out unfiltered (fine for `sleep`/`steps`/etc. which default to a
+  single day, just less efficient).
 
 ## Commands
 
