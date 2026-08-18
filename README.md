@@ -2,18 +2,21 @@
 
 An intelligent, app-less health assistant that connects your Fitbit or Pixel Watch data (via the Google Health API) with Claude AI over Telegram. Get personalized daily health summaries at 7 AM and ask interactive health questions.
 
-> **Status:** Phase 2 (OAuth) is built and wired up against the Google Health API
-> client. The one open item is the `filter` query grammar for fetching data
-> points — see [Google Health API migration](#google-health-api-migration) below.
+> **Status:** OAuth (`routes/auth.py`) and the Claude tool-use query pipeline
+> (`services/claude.py` + `routes/mcp_tools.py`) are built and wired up. The
+> Telegram bot, daily-summary scheduler, and `/api/health` endpoints are not
+> built yet — see the project structure below. The one open item on the
+> Google Health API client itself is the `filter` query grammar for fetching
+> data points — see [Google Health API migration](#google-health-api-migration).
 
 ## Architecture
 
 ```
 Telegram Bot → FastAPI Backend → Google Health API (health.googleapis.com)
                     ↓
-                 Claude 3.5 Sonnet
+                Claude (tool use)
                     ↓
-              MCP Tool Calling
+         get_health_metric tool call
 ```
 
 ## Features
@@ -40,21 +43,16 @@ Telegram Bot → FastAPI Backend → Google Health API (health.googleapis.com)
 ├── probe_health_api.py       # Standalone script: verify Google Health API access
 │
 ├── routes/                   # API endpoints
-│   ├── auth.py              # OAuth 2.0 login/callback
-│   ├── telegram.py          # Telegram webhook handler
-│   ├── health.py            # Health data endpoints
-│   └── mcp_tools.py         # MCP tool definitions
+│   ├── auth.py              # OAuth 2.0 login/callback (built)
+│   ├── mcp_tools.py         # Tool schema + interactive query endpoint (built)
+│   ├── telegram.py          # Telegram webhook handler (not built yet)
+│   └── health.py            # Health data endpoints (not built yet)
 │
 ├── services/                # Business logic
-│   ├── google_health.py     # Google Health API client
-│   ├── claude.py            # Claude AI integration
-│   ├── telegram_bot.py      # Telegram bot helper
-│   └── scheduler.py         # Daily scheduler
-│
-├── utils/                   # Utilities
-│   ├── logger.py            # Logging setup
-│   ├── security.py          # Token encryption
-│   └── decorators.py        # Custom decorators
+│   ├── google_health.py     # Google Health API client (built)
+│   ├── claude.py            # Claude AI integration + tool-use loop (built)
+│   ├── telegram_bot.py      # Telegram bot helper (not built yet)
+│   └── scheduler.py         # Daily scheduler (not built yet)
 │
 └── tests/                   # Test suite
     └── test_*.py
@@ -159,20 +157,25 @@ uvicorn app:app --reload
 
 ## API Endpoints
 
-### Authentication
+### Authentication (built)
 - `GET /auth/login` - Start OAuth flow
 - `GET /auth/callback?code=...&state=...` - OAuth callback
+- `POST /auth/refresh-token` - Manually refresh an OAuth token
+- `GET /auth/status/{user_id}` - Check token status
+- `GET /auth/disconnect/{user_id}` - Disconnect account
 
-### Telegram Webhook
-- `POST /webhook/telegram` - Receive Telegram messages
+### MCP / Claude tool use (built)
+- `GET /mcp/tools` - The tool schema Claude is given for health queries
+- `POST /mcp/query` - Ask a natural-language health question for a connected user
 
-### Health Data
-- `GET /api/health/summary/{user_id}` - Get latest summary
-- `POST /api/health/query` - Interactive health query
-
-### Health Check
+### Health Check (built)
 - `GET /health` - Service status
 - `GET /` - API info
+
+### Not built yet
+- `POST /webhook/telegram` - Receive Telegram messages
+- `GET /api/health/summary/{user_id}` - Get latest daily summary
+- `POST /api/health/query` - Interactive health query via Telegram
 
 ## Usage
 
