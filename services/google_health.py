@@ -1,191 +1,231 @@
 """
-Google Health API Client
-Handles OAuth 2.0 authorization and Fitbit data fetching
+Google Health API client  (health.googleapis.com, v4)
+
+Replaces the earlier module, which targeted the Google Fit REST API
+(fitness.googleapis.com). That API has been closed to new developer sign-ups
+since 1 May 2024 and is being deprecated in 2026 — a new Google Cloud project
+cannot use it. The Google Health API is the supported successor and is also
+the migration target for the Fitbit Web API, which sunsets September 2026.
+
+Docs
+  Service endpoint : https://health.googleapis.com
+  List data points : GET /v4/users/me/dataTypes/{dataType}/dataPoints
+  Reference        : https://developers.google.com/health/reference/rest
+
+Caveat, deliberately not hidden:
+  The exact `filter` expression grammar is not fully specified in the public
+  reference. `FILTER_TEMPLATES` below holds several candidate forms; the probe
+  script (probe_health_api.py) tries each and reports which the API accepts.
+  Once you know, set FILTER_TEMPLATE_IN_USE and delete the rest.
 """
 
+from __future__ import annotations
+
 import logging
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
+
 import httpx
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
-from config import settings
 
 logger = logging.getLogger(__name__)
 
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+
+AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
+TOKEN_URI = "https://oauth2.googleapis.com/token"
+REVOKE_URI = "https://oauth2.googleapis.com/revoke"
+
+HEALTH_BASE = "https://health.googleapis.com/v4"
+
+# Scopes are Restricted. Request only what the product actually reads.
+SCOPES = [
+    "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
+    "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
+    "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
+]
+
+# dataType path segments are kebab-case.
+DATA_TYPES = {
+    "sleep": "sleep",
+    "steps": "steps",
+    "heart_rate": "heart-rate",
+    "active_minutes": "active-minutes",
+    "calories": "total-calories",
+}
+
+# pageSize ceilings differ by type: sleep and exercise cap at 25.
+PAGE_SIZE = {
+    "sleep": 25,
+    "steps": 1440,
+    "heart-rate": 1440,
+    "active-minutes": 1440,
+    "total-calories": 1440,
+}
+
+# Candidate filter grammars — see module docstring.
+FILTER_TEMPLATES = [
+    'dailySummaryDate >= "{start_date}" AND dailySummaryDate <= "{end_date}"',
+    'startTime >= "{start_rfc}" AND endTime <= "{end_rfc}"',
+    'sampleTime >= "{start_rfc}" AND sampleTime <= "{end_rfc}"',
+]
+FILTER_TEMPLATE_IN_USE: str | None = None  # set once the probe confirms one
+
+
+class GoogleHealthError(RuntimeError):
+    """Raised when the Health API returns a non-2xx response."""
+
+    def __init__(self, status: int, body: str, url: str):
+        super().__init__(f"{status} from {url}: {body[:400]}")
+        self.status = status
+        self.body = body
+        self.url = url
+
+
+@dataclass
+class TokenBundle:
+    access_token: str
+    refresh_token: str | None
+    expires_at: datetime
+    scope: str = ""
+
+    @property
+    def is_expiring_soon(self) -> bool:
+        # Refresh proactively so a request never fails on a stale token.
+        return datetime.now(timezone.utc) >= self.expires_at - timedelta(minutes=5)
+
+
+# --------------------------------------------------------------------------
+# Client
+# --------------------------------------------------------------------------
+
 class GoogleHealthClient:
-    """Google Health API (Fitbit) client with OAuth 2.0 support"""
+    def __init__(self, client_id: str, client_secret: str, redirect_uri: str,
+                 scopes: list[str] | None = None, timeout: float = 30.0):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.redirect_uri = redirect_uri
+        self.scopes = scopes or SCOPES
+        self.timeout = timeout
 
-    # Google OAuth endpoints
-    OAUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-    OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+    # ---------------- OAuth ----------------
 
-    # Google Health (Fitbit) API endpoints
-    FITBIT_API_BASE = "https://www.googleapis.com/fitness/v1/users/me"
+    def authorization_url(self, state: str) -> str:
+        from urllib.parse import urlencode
 
-    def __init__(self):
-        self.client_id = settings.GOOGLE_CLIENT_ID
-        self.client_secret = settings.GOOGLE_CLIENT_SECRET
-        self.redirect_uri = settings.GOOGLE_REDIRECT_URI
-        self.scopes = settings.GOOGLE_HEALTH_SCOPES or [
-            "https://www.googleapis.com/auth/fitness.sleep.read",
-            "https://www.googleapis.com/auth/fitness.activity.read",
-            "https://www.googleapis.com/auth/fitness.heart_rate.read",
-        ]
+        params = {
+            "client_id": self.client_id,
+            "redirect_uri": self.redirect_uri,
+            "response_type": "code",
+            "scope": " ".join(self.scopes),
+            "state": state,
+            # offline + consent are both required to reliably receive a
+            # refresh_token; without prompt=consent Google omits it on repeat
+            # authorisations for the same user.
+            "access_type": "offline",
+            "prompt": "consent",
+            "include_granted_scopes": "true",
+        }
+        return f"{AUTH_URI}?{urlencode(params)}"
 
-    def get_authorization_url(self, state: str) -> str:
-        """
-        Generate Google OAuth authorization URL
-        Returns URL for user to click and authorize
-        """
-        flow = Flow.from_client_config(
-            {
-                "installed": {
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "auth_uri": settings.GOOGLE_AUTH_URI if hasattr(settings, 'GOOGLE_AUTH_URI') else "https://accounts.google.com/o/oauth2/auth",
-                    "token_uri": settings.GOOGLE_TOKEN_URI,
-                }
-            },
-            scopes=self.scopes,
-            redirect_uri=self.redirect_uri
+    async def exchange_code(self, code: str) -> TokenBundle:
+        async with httpx.AsyncClient(timeout=self.timeout) as c:
+            r = await c.post(TOKEN_URI, data={
+                "code": code,
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "redirect_uri": self.redirect_uri,
+                "grant_type": "authorization_code",
+            })
+        if r.status_code >= 400:
+            raise GoogleHealthError(r.status_code, r.text, TOKEN_URI)
+        return self._bundle(r.json())
+
+    async def refresh(self, refresh_token: str) -> TokenBundle:
+        async with httpx.AsyncClient(timeout=self.timeout) as c:
+            r = await c.post(TOKEN_URI, data={
+                "refresh_token": refresh_token,
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "grant_type": "refresh_token",
+            })
+        if r.status_code >= 400:
+            # invalid_grant here usually means the consent screen is still in
+            # "Testing", where refresh tokens expire after seven days.
+            raise GoogleHealthError(r.status_code, r.text, TOKEN_URI)
+        data = r.json()
+        data.setdefault("refresh_token", refresh_token)  # not always returned
+        return self._bundle(data)
+
+    async def revoke(self, token: str) -> None:
+        async with httpx.AsyncClient(timeout=self.timeout) as c:
+            await c.post(REVOKE_URI, data={"token": token})
+
+    @staticmethod
+    def _bundle(data: dict[str, Any]) -> TokenBundle:
+        return TokenBundle(
+            access_token=data["access_token"],
+            refresh_token=data.get("refresh_token"),
+            expires_at=datetime.now(timezone.utc)
+                       + timedelta(seconds=int(data.get("expires_in", 3600))),
+            scope=data.get("scope", ""),
         )
 
-        auth_url, _ = flow.authorization_url(state=state)
-        return auth_url
+    # ---------------- Data ----------------
 
-    async def exchange_code_for_tokens(self, code: str) -> Dict[str, Any]:
-        """
-        Exchange authorization code for access & refresh tokens
-        Returns: {access_token, refresh_token, expires_in, ...}
-        """
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                settings.GOOGLE_TOKEN_URI,
-                data={
-                    "code": code,
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "redirect_uri": self.redirect_uri,
-                    "grant_type": "authorization_code",
-                }
-            )
-            response.raise_for_status()
-            tokens = response.json()
-            logger.info(f"✅ Successfully exchanged auth code for tokens")
-            return tokens
+    async def list_data_points(
+        self,
+        access_token: str,
+        data_type: str,
+        start: date,
+        end: date,
+        *,
+        filter_template: str | None = None,
+        page_size: int | None = None,
+    ) -> dict[str, Any]:
+        """One page of data points for a kebab-case dataType over [start, end]."""
+        url = f"{HEALTH_BASE}/users/me/dataTypes/{data_type}/dataPoints"
 
-    async def refresh_access_token(self, refresh_token: str) -> Dict[str, Any]:
-        """
-        Refresh an expired access token using refresh token
-        Returns: {access_token, expires_in, ...}
-        """
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                settings.GOOGLE_TOKEN_URI,
-                data={
-                    "refresh_token": refresh_token,
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                    "grant_type": "refresh_token",
-                }
-            )
-            response.raise_for_status()
-            tokens = response.json()
-            logger.info("✅ Successfully refreshed access token")
-            return tokens
-
-    async def fetch_sleep_data(self, access_token: str, date: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Fetch sleep data from Google Health API
-        Returns raw Fitbit sleep data
-        """
-        if not date:
-            date = datetime.utcnow().strftime("%Y-%m-%d")
-
-        # Convert date to milliseconds (Google Fit API expects timestamps)
-        date_obj = datetime.strptime(date, "%Y-%m-%d")
-        start_time = int(date_obj.timestamp() * 1000)
-        end_time = int((date_obj + timedelta(days=1)).timestamp() * 1000)
-
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{self.FITBIT_API_BASE}/dataset:read",
-                headers={"Authorization": f"Bearer {access_token}"},
-                params={
-                    "dataSourceId": "derived:com.google.sleep.segment:com.google.android.gms:merge_sleep_data",
-                    "startTimeMillis": start_time,
-                    "endTimeMillis": end_time,
-                }
-            )
-            response.raise_for_status()
-            return response.json()
-
-    async def fetch_activity_data(self, access_token: str, date: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Fetch activity data (steps, calories, active zones) from Google Health API
-        """
-        if not date:
-            date = datetime.utcnow().strftime("%Y-%m-%d")
-
-        date_obj = datetime.strptime(date, "%Y-%m-%d")
-        start_time = int(date_obj.timestamp() * 1000)
-        end_time = int((date_obj + timedelta(days=1)).timestamp() * 1000)
-
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{self.FITBIT_API_BASE}/dataset:read",
-                headers={"Authorization": f"Bearer {access_token}"},
-                params={
-                    "dataSourceId": "derived:com.google.step_count.delta:com.google.android.gms:merge_step_deltas",
-                    "startTimeMillis": start_time,
-                    "endTimeMillis": end_time,
-                }
-            )
-            response.raise_for_status()
-            return response.json()
-
-    async def fetch_heart_rate_data(self, access_token: str, date: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Fetch heart rate data from Google Health API
-        """
-        if not date:
-            date = datetime.utcnow().strftime("%Y-%m-%d")
-
-        date_obj = datetime.strptime(date, "%Y-%m-%d")
-        start_time = int(date_obj.timestamp() * 1000)
-        end_time = int((date_obj + timedelta(days=1)).timestamp() * 1000)
-
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{self.FITBIT_API_BASE}/dataset:read",
-                headers={"Authorization": f"Bearer {access_token}"},
-                params={
-                    "dataSourceId": "derived:com.google.heart_rate.bpm:com.google.android.gms:merge_heart_rate_bpm",
-                    "startTimeMillis": start_time,
-                    "endTimeMillis": end_time,
-                }
-            )
-            response.raise_for_status()
-            return response.json()
-
-    async def fetch_all_health_data(self, access_token: str, date: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Fetch all health data (sleep, activity, heart rate) in one call
-        Returns: {sleep: {...}, activity: {...}, heart_rate: {...}}
-        """
-        sleep_data = await self.fetch_sleep_data(access_token, date)
-        activity_data = await self.fetch_activity_data(access_token, date)
-        heart_rate_data = await self.fetch_heart_rate_data(access_token, date)
-
-        return {
-            "sleep": sleep_data,
-            "activity": activity_data,
-            "heart_rate": heart_rate_data,
-            "date": date or datetime.utcnow().strftime("%Y-%m-%d"),
+        params: dict[str, Any] = {
+            "pageSize": page_size or PAGE_SIZE.get(data_type, 1440),
         }
 
+        template = filter_template or FILTER_TEMPLATE_IN_USE
+        if template:
+            params["filter"] = template.format(
+                start_date=start.isoformat(),
+                end_date=end.isoformat(),
+                start_rfc=f"{start.isoformat()}T00:00:00Z",
+                end_rfc=f"{end.isoformat()}T23:59:59Z",
+            )
 
-# Global instance
-google_health_client = GoogleHealthClient()
+        async with httpx.AsyncClient(timeout=self.timeout) as c:
+            r = await c.get(url, params=params,
+                            headers={"Authorization": f"Bearer {access_token}"})
+
+        if r.status_code >= 400:
+            raise GoogleHealthError(r.status_code, r.text, str(r.request.url))
+        return r.json()
+
+    async def fetch_day(self, access_token: str, day: date) -> dict[str, Any]:
+        """
+        Every metric for a single day, keyed by friendly name.
+
+        A failure on one data type does not sink the others — a missing metric
+        produces a shorter summary, which is the documented degradation path.
+        """
+        out: dict[str, Any] = {"date": day.isoformat(), "metrics": {}, "errors": {}}
+
+        for friendly, path in DATA_TYPES.items():
+            try:
+                out["metrics"][friendly] = await self.list_data_points(
+                    access_token, path, day, day
+                )
+            except GoogleHealthError as e:
+                logger.warning("fetch %s failed: %s", friendly, e)
+                out["errors"][friendly] = {"status": e.status, "body": e.body[:400]}
+
+        return out
