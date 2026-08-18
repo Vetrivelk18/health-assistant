@@ -1,11 +1,15 @@
 # AI Health Assistant
 
-An intelligent, app-less health assistant that connects your Fitbit account with Claude AI via Telegram. Get personalized daily health summaries at 7 AM and ask interactive health questions.
+An intelligent, app-less health assistant that connects your Fitbit or Pixel Watch data (via the Google Health API) with Claude AI over Telegram. Get personalized daily health summaries at 7 AM and ask interactive health questions.
+
+> **Status:** Phase 2 (OAuth) is built. The Google Health API client was recently
+> rewritten — see [Google Health API migration](#google-health-api-migration) below
+> before touching `services/google_health.py` or the OAuth routes.
 
 ## Architecture
 
 ```
-Telegram Bot → FastAPI Backend → Google Health API (Fitbit)
+Telegram Bot → FastAPI Backend → Google Health API (health.googleapis.com)
                     ↓
                  Claude 3.5 Sonnet
                     ↓
@@ -30,6 +34,10 @@ Telegram Bot → FastAPI Backend → Google Health API (Fitbit)
 ├── requirements.txt          # Python dependencies
 ├── .env.example              # Environment template
 ├── README.md                 # This file
+├── AGENTS.md                 # Instructions for coding agents working in this repo
+├── PHASE2_OAUTH.md           # Notes from the OAuth build-out
+├── README_PROBE.md           # How to run the standalone API probe script
+├── probe_health_api.py       # Standalone script: verify Google Health API access
 │
 ├── routes/                   # API endpoints
 │   ├── auth.py              # OAuth 2.0 login/callback
@@ -103,10 +111,37 @@ python -c "from database import init_db; init_db()"
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com)
 2. Create a new project
-3. Enable "Google Fit API"
+3. Enable **"Google Health API"** — *not* "Google Fit API". Google Fit closed
+   to new sign-ups on 1 May 2024 and is being deprecated in 2026; the Google
+   Health API (`health.googleapis.com`) is the supported successor and reads
+   from the same Fitbit/Pixel Watch devices. See
+   [Google Health API migration](#google-health-api-migration).
 4. Create OAuth 2.0 credentials (Web Application)
-5. Set redirect URI: `http://localhost:5000/auth/callback`
-6. Copy Client ID & Secret to `.env`
+5. Set redirect URI to match `GOOGLE_REDIRECT_URI` in `.env` (default
+   `http://127.0.0.1:8765/auth/callback` for the probe script;
+   `http://localhost:5000/auth/callback` for the FastAPI app)
+6. Add the scopes from `.env.example` (`GOOGLE_HEALTH_SCOPES`) on the OAuth
+   consent screen — they are **Restricted** scopes, so add yourself as a test
+   user rather than going through verification
+7. Copy Client ID & Secret to `.env`
+
+#### Google Health API migration
+
+`services/google_health.py` was rewritten to target `health.googleapis.com`
+instead of the old `fitness.googleapis.com` (Google Fit) endpoints. Before
+building further on top of it:
+
+1. Run the standalone probe script to confirm the API returns real data for
+   your account and to discover the working filter grammar — see
+   [`README_PROBE.md`](README_PROBE.md).
+2. Once the probe reports a working filter, set `FILTER_TEMPLATE_IN_USE` in
+   `services/google_health.py` per the script's instructions.
+3. `config.py` and `routes/auth.py` still reference the old Google Fit scopes
+   and the old `GoogleHealthClient` interface (a module-level
+   `google_health_client` singleton with a `get_authorization_url()` method).
+   The new client takes `client_id`/`client_secret`/`redirect_uri` explicitly
+   and exposes `authorization_url()` — these callers need updating to match
+   before the `/auth/login` route will work again.
 
 ### 6. Telegram Bot Setup
 
@@ -269,6 +304,13 @@ Tokens auto-refresh. Check `oauth_tokens` table for expiration.
 1. Refresh OAuth token (auto-handled)
 2. Verify `GOOGLE_CLIENT_SECRET` is correct
 3. Check redirect URI matches console
+
+### Refresh token stopped working after ~7 days
+
+While the OAuth consent screen is in **Testing**, Google expires refresh
+tokens after 7 days. Either re-authorize weekly or publish the OAuth consent
+screen to **Production** (real users additionally require OAuth verification —
+a security review plus a published privacy policy and terms of service).
 
 ## Security Notes
 
