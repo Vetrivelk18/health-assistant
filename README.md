@@ -2,9 +2,9 @@
 
 An intelligent, app-less health assistant that connects your Fitbit or Pixel Watch data (via the Google Health API) with Claude AI over Telegram. Get personalized daily health summaries at 7 AM and ask interactive health questions.
 
-> **Status:** Phase 2 (OAuth) is built. The Google Health API client was recently
-> rewritten — see [Google Health API migration](#google-health-api-migration) below
-> before touching `services/google_health.py` or the OAuth routes.
+> **Status:** Phase 2 (OAuth) is built and wired up against the Google Health API
+> client. The one open item is the `filter` query grammar for fetching data
+> points — see [Google Health API migration](#google-health-api-migration) below.
 
 ## Architecture
 
@@ -128,20 +128,15 @@ python -c "from database import init_db; init_db()"
 #### Google Health API migration
 
 `services/google_health.py` was rewritten to target `health.googleapis.com`
-instead of the old `fitness.googleapis.com` (Google Fit) endpoints. Before
-building further on top of it:
+instead of the old `fitness.googleapis.com` (Google Fit) endpoints, and
+`routes/auth.py`/`config.py` have been updated to match the new
+`GoogleHealthClient` interface. What's still open:
 
 1. Run the standalone probe script to confirm the API returns real data for
    your account and to discover the working filter grammar — see
    [`README_PROBE.md`](README_PROBE.md).
 2. Once the probe reports a working filter, set `FILTER_TEMPLATE_IN_USE` in
    `services/google_health.py` per the script's instructions.
-3. `config.py` and `routes/auth.py` still reference the old Google Fit scopes
-   and the old `GoogleHealthClient` interface (a module-level
-   `google_health_client` singleton with a `get_authorization_url()` method).
-   The new client takes `client_id`/`client_secret`/`redirect_uri` explicitly
-   and exposes `authorization_url()` — these callers need updating to match
-   before the `/auth/login` route will work again.
 
 ### 6. Telegram Bot Setup
 

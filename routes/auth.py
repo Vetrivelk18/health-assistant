@@ -5,7 +5,7 @@ Handles /login (start OAuth flow) and /callback (receive auth code)
 
 import logging
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -14,15 +14,27 @@ import httpx
 
 from database import get_db, SessionLocal
 from models import User, OAuthToken
-from services.google_health import google_health_client
+from services.google_health import GoogleHealthClient, GoogleHealthError
 from config import settings
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+google_health_client = GoogleHealthClient(
+    client_id=settings.GOOGLE_CLIENT_ID,
+    client_secret=settings.GOOGLE_CLIENT_SECRET,
+    redirect_uri=settings.GOOGLE_REDIRECT_URI,
+    scopes=settings.GOOGLE_HEALTH_SCOPES,
+)
+
 # Store OAuth state temporarily (in production, use Redis)
 _oauth_states = {}
+
+
+def _naive_utc(dt: datetime) -> datetime:
+    """Strip tzinfo after normalizing to UTC — DB columns store naive UTC."""
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 @router.get("/login")
@@ -45,7 +57,7 @@ async def start_oauth_flow(telegram_chat_id: str, db: Session = Depends(get_db))
     }
 
     # Get authorization URL from Google
-    auth_url = google_health_client.get_authorization_url(state)
+    auth_url = google_health_client.authorization_url(state)
 
     logger.info(f"📍 OAuth flow initiated for Telegram chat {telegram_chat_id}")
     logger.info(f"🔗 Auth URL: {auth_url}")
@@ -88,17 +100,13 @@ async def oauth_callback(
 
     try:
         # Exchange code for tokens
-        tokens = await google_health_client.exchange_code_for_tokens(code)
+        tokens = await google_health_client.exchange_code(code)
 
         logger.info(f"✅ Got tokens from Google for {telegram_chat_id}")
 
-        # Extract token info
-        access_token = tokens.get("access_token")
-        refresh_token = tokens.get("refresh_token")
-        expires_in = tokens.get("expires_in", 3600)  # Default 1 hour
-
-        # Calculate expiration time
-        expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+        access_token = tokens.access_token
+        refresh_token = tokens.refresh_token
+        expires_at = _naive_utc(tokens.expires_at)
 
         # Get or create user
         user = db.query(User).filter(User.telegram_chat_id == telegram_chat_id).first()
@@ -136,7 +144,7 @@ async def oauth_callback(
                 access_token=access_token,
                 refresh_token=refresh_token,
                 expires_at=expires_at,
-                scope=" ".join(google_health_client.scopes),
+                scope=tokens.scope or " ".join(google_health_client.scopes),
             )
             db.add(oauth_token)
 
@@ -152,6 +160,10 @@ async def oauth_callback(
             "token_expires_at": expires_at.isoformat(),
         }
 
+    except GoogleHealthError as e:
+        logger.error(f"🚨 OAuth callback error: {e}")
+        status = e.status if 400 <= e.status < 500 else 502
+        raise HTTPException(status_code=status, detail=f"OAuth error: {e}")
     except Exception as e:
         logger.error(f"🚨 OAuth callback error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"OAuth error: {str(e)}")
@@ -177,15 +189,16 @@ async def refresh_token_endpoint(user_id: str, db: Session = Depends(get_db)):
 
     try:
         # Exchange refresh token for new access token
-        tokens = await google_health_client.refresh_access_token(oauth_token.refresh_token)
+        tokens = await google_health_client.refresh(oauth_token.refresh_token)
 
-        access_token = tokens.get("access_token")
-        expires_in = tokens.get("expires_in", 3600)
-        expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+        access_token = tokens.access_token
+        expires_at = _naive_utc(tokens.expires_at)
 
         # Update token in database
         oauth_token.access_token = access_token
         oauth_token.expires_at = expires_at
+        if tokens.refresh_token:
+            oauth_token.refresh_token = tokens.refresh_token
         oauth_token.updated_at = datetime.utcnow()
         db.commit()
 
@@ -198,6 +211,13 @@ async def refresh_token_endpoint(user_id: str, db: Session = Depends(get_db)):
             "expires_at": expires_at.isoformat(),
         }
 
+    except GoogleHealthError as e:
+        logger.error(f"🚨 Token refresh error: {e}")
+        if "invalid_grant" in e.body:
+            logger.error("   invalid_grant usually means the consent screen is in "
+                         "'Testing', where refresh tokens expire after 7 days.")
+        status = e.status if 400 <= e.status < 500 else 502
+        raise HTTPException(status_code=status, detail=f"Token refresh failed: {e}")
     except Exception as e:
         logger.error(f"🚨 Token refresh error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Token refresh failed: {str(e)}")
