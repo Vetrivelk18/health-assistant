@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.env
+.env.local
+fixtures/
+.probe_tokens.json
+.claude/
+.DS_Store

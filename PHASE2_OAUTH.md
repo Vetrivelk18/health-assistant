@@ -37,8 +37,8 @@ GOOGLE_REDIRECT_URI=http://localhost:5000/auth/callback
 GOOGLE_PROJECT_ID=health-assistant-505718
 GOOGLE_TOKEN_URI=https://oauth2.googleapis.com/token
 
-# Claude API
-CLAUDE_API_KEY=your_claude_api_key_here
+# Gemini API (superseded CLAUDE_API_KEY — see services/gemini.py)
+GEMINI_API_KEY=your_gemini_api_key_here
 
 # Database
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/health_assistant

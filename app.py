@@ -1,14 +1,15 @@
 """
 AI Health Assistant - Main FastAPI Application
-Integrates Google Health API, Claude AI, and Telegram Bot
+Integrates Google Health API, Gemini AI, and Telegram Bot
 """
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import logging
 import os
 from dotenv import load_dotenv
+from sqlalchemy import text
 
 # Load environment variables
 load_dotenv()
@@ -18,8 +19,8 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
 # Import routers
-from routes import auth, mcp_tools
-# from routes import telegram, health
+from routes import auth, internal, mcp_tools, telegram
+# from routes import health
 
 # Lifespan context for startup/shutdown
 @asynccontextmanager
@@ -36,7 +37,7 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app
 app = FastAPI(
     title="AI Health Assistant",
-    description="Fitbit + Claude + Telegram integration for personalized health insights",
+    description="Fitbit + Gemini + Telegram integration for personalized health insights",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -52,7 +53,20 @@ app.add_middleware(
 
 # Health check endpoint
 @app.get("/health")
-async def health_check():
+async def health_check(response: Response):
+    from database import SessionLocal
+
+    try:
+        db = SessionLocal()
+        try:
+            db.execute(text("SELECT 1"))
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"🚨 /health DB check failed: {e}")
+        response.status_code = 503
+        return {"status": "unhealthy", "service": "AI Health Assistant", "detail": "database unreachable"}
+
     return {
         "status": "healthy",
         "service": "AI Health Assistant",
@@ -71,7 +85,8 @@ async def root():
 # Include routers
 app.include_router(auth.router, prefix="/auth", tags=["authentication"])
 app.include_router(mcp_tools.router, prefix="/mcp", tags=["mcp"])
-# app.include_router(telegram.router, prefix="/webhook", tags=["telegram"])
+app.include_router(telegram.router, prefix="/webhook", tags=["telegram"])
+app.include_router(internal.router, prefix="/internal", tags=["internal"])
 # app.include_router(health.router, prefix="/api/health", tags=["health"])
 
 if __name__ == "__main__":
@@ -79,6 +94,6 @@ if __name__ == "__main__":
     uvicorn.run(
         "app:app",
         host=os.getenv("FASTAPI_HOST", "0.0.0.0"),
-        port=int(os.getenv("FASTAPI_PORT", 5000)),
+        port=int(os.getenv("PORT", os.getenv("FASTAPI_PORT", 5000))),
         reload=os.getenv("FASTAPI_ENV") == "development"
     )

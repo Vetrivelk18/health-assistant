@@ -1,5 +1,5 @@
 # Web Framework
-fastapi==0.104.1
+fastapi==0.115.0
 uvicorn==0.24.0
 python-multipart==0.0.6
 
@@ -9,19 +9,21 @@ google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.0
 google-api-python-client==2.107.0
 
-# Claude API
-anthropic==0.69.0
+# Gemini API (google-genai, not the deprecated google-generativeai)
+google-genai==1.47.0
 
-# Telegram Bot
-python-telegram-bot==20.7
+# Telegram Bot — no SDK; services/telegram_bot.py talks to the Bot API
+# directly over httpx, so no python-telegram-bot dependency is needed.
 
 # Database
 sqlalchemy==2.0.23
 psycopg2-binary==2.9.9
 alembic==1.13.1
 
-# Task Scheduling
-APScheduler==3.10.4
+# Task Scheduling: none. Cloud Run containers don't stay alive between
+# requests, so an in-process scheduler would silently never fire — the daily
+# job is triggered externally by Cloud Scheduler calling POST
+# /internal/run-daily instead. See DEPLOY.md.
 
 # Token Management & Security
 pyjwt==2.8.0
@@ -33,21 +35,18 @@ cryptography==41.0.7
 python-dotenv==1.0.0
 
 # HTTP Requests
-httpx==0.25.2
+httpx==0.28.1
 requests==2.31.0
 
 # Logging
 python-json-logger==2.0.7
 
 # Type Hints & Validation
-pydantic==2.5.2
-pydantic-settings==2.1.0
+pydantic==2.9.2
+pydantic-settings==2.5.2
 
 # Development (optional)
 pytest==7.4.3
 pytest-asyncio==0.21.1
 black==23.12.0
 flake8==6.1.0
-
-# MCP Support
-mcp==0.1.0

@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from config import settings
 from database import get_db
 from models import OAuthToken
-from services import claude
+from services import gemini
 from services.google_health import GoogleHealthClient, GoogleHealthError
 
 logger = logging.getLogger(__name__)
@@ -40,15 +40,15 @@ class QueryRequest(BaseModel):
 
 @router.get("/tools")
 async def list_tools() -> list[dict[str, Any]]:
-    """The tool schema Claude is given for interactive health queries."""
-    return claude.tool_schema()
+    """The tool schema Gemini is given for interactive health queries."""
+    return gemini.tool_schema()
 
 
 @router.post("/query")
 async def run_query(body: QueryRequest, db: Session = Depends(get_db)):
     """
     Answer a natural-language health question for a connected user, letting
-    Claude call back into the Google Health API via tool use as needed.
+    Gemini call back into the Google Health API via function calling as needed.
     """
     oauth_token = db.query(OAuthToken).filter(OAuthToken.user_id == body.user_id).first()
     if not oauth_token:
@@ -57,7 +57,7 @@ async def run_query(body: QueryRequest, db: Session = Depends(get_db)):
     access_token = await _valid_access_token(oauth_token, db)
 
     try:
-        answer = await claude.answer_health_query(body.message, access_token, google_health_client)
+        answer = await gemini.answer_health_query(body.message, access_token, google_health_client)
     except GoogleHealthError as e:
         logger.error(f"🚨 MCP query error: {e}")
         raise HTTPException(status_code=502, detail=f"Google Health API error: {e}")

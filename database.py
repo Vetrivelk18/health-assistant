@@ -11,11 +11,16 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Create engine
+# On Cloud Run a fresh pool is created on every cold start, so there's no
+# benefit to a large persistent pool the way there would be on a long-lived
+# server — NullPool (one connection per checkout, no idle pool) avoids
+# holding stale connections across scale-to-zero gaps. pool_pre_ping guards
+# against Neon closing an idle connection out from under us.
 engine = create_engine(
     settings.DATABASE_URL,
     echo=settings.SQLALCHEMY_ECHO,
-    poolclass=NullPool if settings.FASTAPI_ENV == "testing" else None,
+    poolclass=NullPool if settings.FASTAPI_ENV != "development" else None,
+    pool_pre_ping=True,
 )
 
 # Session factory
