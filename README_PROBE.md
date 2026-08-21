@@ -92,11 +92,15 @@ Raw responses land in `fixtures/*.json`.
 | `401` | Token or scope problem. Re-run; check the granted scopes in the output. |
 | `403` | API not enabled on the project, or the scope was not granted. |
 | `404` | Wrong data type path. Report it — the names may have changed. |
-| `FAIL` on everything | Read the note column; the status code says which. |
+| `FAIL` on `calories` specifically | Expected — `total-calories` only supports `rollup`/`dailyRollUp`, not `list`. Not something to debug here. |
+| `FAIL` on everything else | Read the note column; the status code says which. |
 
-The script also discovers the **filter grammar** by trying candidates until one
-is accepted, then prints the winner. Copy it into `FILTER_TEMPLATE_IN_USE` in
-`services/google_health.py` and the client is finished.
+The **filter grammar** is confirmed and baked into `FILTER_TEMPLATE_BY_TYPE`
+in `services/google_health.py` — it's per data type, not one shared grammar
+(e.g. `sleep.interval.end_time` for sleep vs.
+`heart_rate.sample_time.physical_time` for heart rate). `list_data_points`
+applies the right one automatically; this script no longer needs to
+rediscover it, just confirm data actually comes back for your account.
 
 ---
 

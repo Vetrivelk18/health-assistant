@@ -12,11 +12,22 @@ Docs
   List data points : GET /v4/users/me/dataTypes/{dataType}/dataPoints
   Reference        : https://developers.google.com/health/reference/rest
 
-Caveat, deliberately not hidden:
-  The exact `filter` expression grammar is not fully specified in the public
-  reference. `FILTER_TEMPLATES` below holds several candidate forms; the probe
-  script (probe_health_api.py) tries each and reports which the API accepts.
-  Once you know, set FILTER_TEMPLATE_IN_USE and delete the rest.
+Filter grammar — confirmed against a real account via probe_health_api.py
+(2026-08-22), and it is NOT one shared grammar: each data type restricts on
+a different member path, always prefixed with the type's own (snake_case)
+name — not its kebab-case URL segment, and not camelCase:
+
+  sleep           sleep.interval.end_time
+  steps           steps.interval.start_time
+  heart-rate      heart_rate.sample_time.physical_time
+  active-minutes  active_minutes.interval.start_time
+
+`FILTER_TEMPLATE_BY_TYPE` below holds the confirmed template per type, keyed
+by the kebab-case URL segment. `total-calories` only supports `rollup`/
+`dailyRollUp` actions — `list` 400s on it unconditionally
+(UNSUPPORTED_DATA_TYPE_ACTION) — so it has no filter template and stays
+broken via this client until someone builds the separate rollup request
+shape (a different HTTP method/body, not just a filter).
 """
 
 from __future__ import annotations
@@ -48,7 +59,10 @@ SCOPES = [
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
 ]
 
-# dataType path segments are kebab-case.
+# dataType path segments are kebab-case. "calories" always 400s via this
+# client — total-calories only supports rollup/dailyRollUp, not list. Left
+# in so it degrades gracefully (fetch_day records it under "errors") rather
+# than silently vanishing from the schema.
 DATA_TYPES = {
     "sleep": "sleep",
     "steps": "steps",
@@ -66,13 +80,18 @@ PAGE_SIZE = {
     "total-calories": 1440,
 }
 
-# Candidate filter grammars — see module docstring.
-FILTER_TEMPLATES = [
-    'dailySummaryDate >= "{start_date}" AND dailySummaryDate <= "{end_date}"',
-    'startTime >= "{start_rfc}" AND endTime <= "{end_rfc}"',
-    'sampleTime >= "{start_rfc}" AND sampleTime <= "{end_rfc}"',
-]
-FILTER_TEMPLATE_IN_USE: str | None = None  # set once the probe confirms one
+# Confirmed filter grammar per type — see module docstring. Keyed by the
+# kebab-case dataType URL segment (DATA_TYPES' values).
+FILTER_TEMPLATE_BY_TYPE: dict[str, str] = {
+    "sleep": 'sleep.interval.end_time >= "{start_rfc}" '
+             'AND sleep.interval.end_time < "{end_rfc}"',
+    "steps": 'steps.interval.start_time >= "{start_rfc}" '
+             'AND steps.interval.start_time < "{end_rfc}"',
+    "heart-rate": 'heart_rate.sample_time.physical_time >= "{start_rfc}" '
+                  'AND heart_rate.sample_time.physical_time < "{end_rfc}"',
+    "active-minutes": 'active_minutes.interval.start_time >= "{start_rfc}" '
+                       'AND active_minutes.interval.start_time < "{end_rfc}"',
+}
 
 
 class GoogleHealthError(RuntimeError):
@@ -193,13 +212,16 @@ class GoogleHealthClient:
             "pageSize": page_size or PAGE_SIZE.get(data_type, 1440),
         }
 
-        template = filter_template or FILTER_TEMPLATE_IN_USE
+        template = filter_template if filter_template is not None else FILTER_TEMPLATE_BY_TYPE.get(data_type)
         if template:
+            # end_rfc is the start of the day *after* `end` — every confirmed
+            # template uses a strict `<` upper bound, so this is what makes
+            # the end date itself inclusive.
             params["filter"] = template.format(
                 start_date=start.isoformat(),
                 end_date=end.isoformat(),
                 start_rfc=f"{start.isoformat()}T00:00:00Z",
-                end_rfc=f"{end.isoformat()}T23:59:59Z",
+                end_rfc=f"{(end + timedelta(days=1)).isoformat()}T00:00:00Z",
             )
 
         async with httpx.AsyncClient(timeout=self.timeout) as c:

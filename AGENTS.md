@@ -60,16 +60,31 @@ are built and wired in. `routes/health.py` (the separate `/api/health/*`
 endpoints, distinct from the existing `GET /health` liveness check) doesn't
 exist yet.
 
-One thing still open:
+The `filter` query grammar for `GET /v4/.../dataPoints` is confirmed (ran
+`probe_health_api.py` against a real account, 2026-08-22 — standalone, no
+FastAPI/DB needed, see `README_PROBE.md`) and lives in
+`FILTER_TEMPLATE_BY_TYPE` in `services/google_health.py`. The public docs
+don't spell this out, and it is **not one shared grammar** — it's genuinely
+per data type, each restricting on a different member path always prefixed
+with the type's snake_case name, e.g. `sleep.interval.end_time` for sleep
+but `heart_rate.sample_time.physical_time` for heart rate (mixing
+`interval.start_time`/`interval.end_time` vs `sample_time.physical_time` per
+type, discovered by testing each candidate directly — the Anthropic-style
+"try templates until one works" approach the old `FILTER_TEMPLATES` list
+assumed doesn't hold here, since a template that works for one type 400s on
+another). `list_data_points` applies the right one automatically now — no
+per-call filter setup needed. `total-calories` has none: `list` 400s on it
+unconditionally (`UNSUPPORTED_DATA_TYPE_ACTION` — only `rollup`/
+`dailyRollUp` are supported), which this client doesn't implement; it's left
+in `DATA_TYPES` so it degrades gracefully (`fetch_day` records it under
+`errors`) rather than silently disappearing from the tool schema.
 
-- The exact `filter` query grammar for `GET /v4/.../dataPoints` isn't fully
-  documented by Google. `FILTER_TEMPLATES` in `services/google_health.py`
-  holds untested candidates; `FILTER_TEMPLATE_IN_USE` is `None` until one is
-  confirmed working. Run `python3 probe_health_api.py` (standalone, no
-  FastAPI/DB needed — see `README_PROBE.md`) against a real account to find
-  it, then set `FILTER_TEMPLATE_IN_USE`. Until then, `get_health_metric` tool
-  calls go out unfiltered (fine for `sleep`/`steps`/etc. which default to a
-  single day, just less efficient).
+One thing still open: that same probe run returned zero data points for
+every type over a 30-day window against the test account — plumbing (auth,
+scopes, filter grammar) is confirmed correct, but no actual device data has
+been confirmed yet. Re-run `probe_health_api.py` against an account with a
+Fitbit/Pixel Watch that's synced recently before assuming this is a code
+bug.
 
 ## Commands
 
