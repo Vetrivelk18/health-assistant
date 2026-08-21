@@ -21,9 +21,9 @@ class Settings:
         "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
     ]
 
-    # Claude API
-    CLAUDE_API_KEY: str = os.getenv("CLAUDE_API_KEY")
-    CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-opus-5")
+    # Gemini API
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
     # Telegram
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -44,6 +44,13 @@ class Settings:
     SCHEDULER_MINUTE: int = int(os.getenv("SCHEDULER_MINUTE", 0))
     TIMEZONE: str = os.getenv("TIMEZONE", "UTC")
 
+    # Cloud Scheduler -> POST /internal/run-daily auth. The Cloud Run service
+    # is deployed --allow-unauthenticated (Telegram must reach the webhook),
+    # so this endpoint verifies the Google-signed OIDC token Cloud Scheduler
+    # sends instead. See DEPLOY.md.
+    RUN_DAILY_AUDIENCE: str = os.getenv("RUN_DAILY_AUDIENCE")  # the deployed Cloud Run service URL
+    SCHEDULER_SERVICE_ACCOUNT_EMAIL: str = os.getenv("SCHEDULER_SERVICE_ACCOUNT_EMAIL")
+
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
@@ -55,7 +62,7 @@ settings = Settings()
 
 # Validate required settings
 def validate_settings():
-    required = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "CLAUDE_API_KEY", "TELEGRAM_BOT_TOKEN"]
+    required = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN"]
     missing = [key for key in required if not getattr(settings, key)]
     if missing:
         raise ValueError(f"Missing required environment variables: {', '.join(missing)}")

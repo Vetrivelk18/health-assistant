@@ -5,9 +5,10 @@ Instructions for coding agents (Claude Code, etc.) working in this repo.
 ## What this is
 
 FastAPI backend that reads Fitbit/Pixel Watch data through the **Google
-Health API** (`health.googleapis.com`), summarizes it with Claude, and
-delivers it over a Telegram bot. See `README.md` for the full architecture
-and setup instructions.
+Health API** (`health.googleapis.com`), summarizes it with Gemini, and
+delivers it over a Telegram bot. Production target is Cloud Run + Cloud
+Scheduler + Neon Postgres — see `DEPLOY.md`. See `README.md` for the full
+architecture and setup instructions.
 
 ## Current state — read before touching OAuth or the Health API client
 
@@ -20,21 +21,44 @@ new `GoogleHealthClient` interface (constructor takes `client_id`/
 `exchange_code()`, `refresh()`, returning a `TokenBundle` instead of a raw
 dict) — `tests/test_auth.py` covers the OAuth routes and passes.
 
-`services/claude.py` (Claude tool-use loop) and `routes/mcp_tools.py`
+`services/gemini.py` (Gemini function-calling loop) and `routes/mcp_tools.py`
 (`GET /mcp/tools`, `POST /mcp/query`) are built and wired into `app.py`.
-`services/claude.py` defines one tool, `get_health_metric`, that Claude calls
+`services/gemini.py` defines one tool, `get_health_metric`, that Gemini calls
 to pull a Fitbit/Pixel Watch metric via `GoogleHealthClient.list_data_points`;
-`tests/test_mcp_tools.py` covers the routes with mocked Claude/Google calls.
-This required bumping `anthropic` in `requirements.txt` from `0.21.0` (too
-old to have a `tools` parameter on `messages.create` at all) to `0.69.0`, and
-changing `config.py`'s `CLAUDE_MODEL` default from the retired
-`claude-3-5-sonnet-20241022` to `claude-opus-5` (now `os.getenv`-overridable).
+`tests/test_mcp_tools.py` covers the routes with mocked Gemini/Google calls.
+It uses `google-genai` (not the deprecated `google-generativeai`) via the
+async client (`client.aio.models.generate_content`); the system prompt goes
+in `GenerateContentConfig(system_instruction=...)`, not a top-level `system=`
+kwarg the way Anthropic did it. `_client` is constructed lazily and stays
+`None` if `GEMINI_API_KEY` is unset, so an unconfigured key doesn't crash
+module import — it only raises (`_require_client()`) when something actually
+tries to call the API.
 
-`routes/telegram.py`, `routes/health.py`, `services/telegram_bot.py`, and
-`services/scheduler.py` — the pieces that would actually call `/mcp/query`
-from a real Telegram message and run the 7am daily summary — don't exist
-yet. `routes/mcp_tools.py` is directly testable via `POST /mcp/query` in the
-meantime.
+Swapping Claude for Gemini also forced a dependency cleanup: `anthropic` and
+the unused `python-telegram-bot`/`mcp` packages are gone, and `fastapi` (→
+`0.115.0`), `httpx` (→ `0.28.1`), and `pydantic`/`pydantic-settings` (→
+`2.9.2`/`2.5.2`) were bumped because `google-genai` needs `anyio>=4.8` /
+`httpx>=0.28.1` / `pydantic>=2.9`, which the old pins couldn't satisfy.
+
+`config.py`'s `GEMINI_MODEL` default is `gemini-3.5-flash-lite`, not
+`gemini-2.5-flash-lite` — pricing docs say 2.5-flash-lite is cheaper, but the
+live API 404s it for this account ("no longer available to new users") and
+names 3.5-flash-lite as the replacement. Both `generate_daily_summary` and
+`answer_health_query` have been run against the real API with a real key and
+work end-to-end (confirmed function calling actually round-trips: Gemini
+calls `get_health_metric`, gets real tool output, answers from it). One
+cosmetic-only issue: the SDK logs a pydantic `UserWarning` about
+`Content`/`Part`/`File` type mismatches when re-appending a `types.Content`
+returned from a previous turn back into the `contents` list for the next
+function-calling round — harmless, doesn't affect the result, not worth
+chasing.
+
+`routes/telegram.py` (webhook: `/start`, `/connect`, `/disconnect`,
+`/status`, plus plain-text queries routed through `services/gemini.py`) and
+`routes/internal.py` (`POST /internal/run-daily`, called by Cloud Scheduler)
+are built and wired in. `routes/health.py` (the separate `/api/health/*`
+endpoints, distinct from the existing `GET /health` liveness check) doesn't
+exist yet.
 
 One thing still open:
 
@@ -92,3 +116,16 @@ python3 probe_health_api.py
 - **Restricted scopes**: the `googlehealth.*.readonly` scopes require adding
   yourself as a test user on the OAuth consent screen while in Testing mode;
   no verification needed until you leave Testing.
+- **No in-process scheduler, on purpose**: Cloud Run containers don't stay
+  alive between requests, so anything like APScheduler (previously listed in
+  `requirements.txt`, never actually wired up) would silently never fire.
+  The daily job is triggered externally — Cloud Scheduler calls
+  `POST /internal/run-daily` and the whole run (refresh → fetch → summarise
+  → store → send) happens synchronously inside that one request. Don't defer
+  any of it with a background task — Cloud Run freezes CPU the instant the
+  response is sent, so anything deferred past that point never completes.
+- **`/internal/run-daily` auth**: the Cloud Run service is deployed
+  `--allow-unauthenticated` (Telegram has to reach the webhook), so this one
+  endpoint verifies the Google-signed OIDC token Cloud Scheduler sends
+  instead, checking both `audience` and the exact service-account email. See
+  `DEPLOY.md`.

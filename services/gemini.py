@@ -1,5 +1,5 @@
 """
-Claude AI integration.
+Gemini AI integration.
 
 Two entry points:
   generate_daily_summary(day_data)
@@ -8,9 +8,14 @@ Two entry points:
       use — the data is already in hand.
 
   answer_health_query(user_message, access_token, health_client)
-      Interactive: Claude decides which metrics (if any) it needs and calls
-      back into the Google Health API via tool use before answering. See
-      the "Interactive Query Pipeline" in README.md.
+      Interactive: Gemini decides which metrics (if any) it needs and calls
+      back into the Google Health API via function calling before answering.
+      See the "Interactive Query Pipeline" in README.md.
+
+Uses the async client (client.aio.models.generate_content) so both entry
+points stay `async def`. The system prompt goes in
+GenerateContentConfig(system_instruction=...) — Gemini has no top-level
+`system=` argument the way Anthropic does.
 """
 
 from __future__ import annotations
@@ -20,14 +25,18 @@ import logging
 from datetime import date, timedelta
 from typing import Any
 
-import anthropic
+from google import genai
+from google.genai import types
 
 from config import settings
 from services.google_health import DATA_TYPES, GoogleHealthClient, GoogleHealthError
 
 logger = logging.getLogger(__name__)
 
-_client = anthropic.Anthropic(api_key=settings.CLAUDE_API_KEY)
+# Constructed lazily-but-once: genai.Client raises immediately if api_key is
+# falsy, so an unset key must not crash module import (routes/tests import
+# this module before any request that would actually need the key arrives).
+_client = genai.Client(api_key=settings.GEMINI_API_KEY) if settings.GEMINI_API_KEY else None
 
 MAX_TOKENS = 1024
 
@@ -55,7 +64,7 @@ doesn't cover what was asked, say so plainly instead of guessing.
 
 
 def tool_schema() -> list[dict[str, Any]]:
-    """The tool definition Claude is given for interactive health queries."""
+    """The tool definition Gemini is given for interactive health queries."""
     return [
         {
             "name": "get_health_metric",
@@ -86,17 +95,42 @@ def tool_schema() -> list[dict[str, Any]]:
     ]
 
 
-def generate_daily_summary(day_data: dict[str, Any]) -> str:
-    response = _client.messages.create(
-        model=settings.CLAUDE_MODEL,
-        max_tokens=MAX_TOKENS,
-        system=DAILY_SUMMARY_SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": f"Today's health data:\n\n{json.dumps(day_data, indent=2)}",
-        }],
+def _gemini_tools() -> list[types.Tool]:
+    """tool_schema()'s Anthropic-shaped dicts, wrapped for Gemini function calling.
+
+    FunctionDeclaration.parameters_json_schema takes a raw JSON Schema dict
+    directly (mutually exclusive with the `parameters` field, which wants a
+    types.Schema object) — so the existing input_schema dicts pass through
+    unmodified.
+    """
+    return [
+        types.Tool(function_declarations=[
+            types.FunctionDeclaration(
+                name=t["name"],
+                description=t["description"],
+                parameters_json_schema=t["input_schema"],
+            )
+            for t in tool_schema()
+        ])
+    ]
+
+
+def _require_client() -> genai.Client:
+    if _client is None:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    return _client
+
+
+async def generate_daily_summary(day_data: dict[str, Any]) -> str:
+    response = await _require_client().aio.models.generate_content(
+        model=settings.GEMINI_MODEL,
+        contents=f"Today's health data:\n\n{json.dumps(day_data, indent=2)}",
+        config=types.GenerateContentConfig(
+            system_instruction=DAILY_SUMMARY_SYSTEM_PROMPT,
+            max_output_tokens=MAX_TOKENS,
+        ),
     )
-    return _text(response)
+    return (response.text or "").strip()
 
 
 async def answer_health_query(
@@ -106,35 +140,40 @@ async def answer_health_query(
     *,
     max_tool_iterations: int = 4,
 ) -> str:
-    """Run the tool-use loop until Claude answers or the iteration cap is hit."""
-    tools = tool_schema()
-    messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
+    """Run the function-calling loop until Gemini answers or the cap is hit."""
+    client = _require_client()
+    tools = _gemini_tools()
+    contents: list[types.Content] = [
+        types.Content(role="user", parts=[types.Part(text=user_message)])
+    ]
 
     for _ in range(max_tool_iterations):
-        response = _client.messages.create(
-            model=settings.CLAUDE_MODEL,
-            max_tokens=MAX_TOKENS,
-            system=QUERY_SYSTEM_PROMPT,
-            tools=tools,
-            messages=messages,
+        response = await client.aio.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=QUERY_SYSTEM_PROMPT,
+                max_output_tokens=MAX_TOKENS,
+                tools=tools,
+            ),
         )
 
-        tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
-        if not tool_use_blocks:
-            return _text(response)
+        calls = response.function_calls
+        if not calls:
+            return (response.text or "").strip()
 
-        messages.append({"role": "assistant", "content": response.content})
+        contents.append(response.candidates[0].content)
 
-        tool_results = []
-        for block in tool_use_blocks:
-            result = await _run_tool(block.input, access_token, health_client)
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": result["content"],
-                "is_error": result["is_error"],
-            })
-        messages.append({"role": "user", "content": tool_results})
+        function_response_parts = []
+        for call in calls:
+            result = await _run_tool(call.args or {}, access_token, health_client)
+            payload = {"error": result["content"]} if result["is_error"] else {"result": result["content"]}
+            function_response_parts.append(types.Part(function_response=types.FunctionResponse(
+                id=call.id,
+                name=call.name,
+                response=payload,
+            )))
+        contents.append(types.Content(role="user", parts=function_response_parts))
 
     logger.warning("answer_health_query hit max_tool_iterations=%d", max_tool_iterations)
     return "I wasn't able to pull that together — try asking again, maybe more specifically."
@@ -173,7 +212,3 @@ async def _run_tool(
 
 def _parse_date(value: str | None) -> date | None:
     return date.fromisoformat(value) if value else None
-
-
-def _text(response: anthropic.types.Message) -> str:
-    return "".join(b.text for b in response.content if b.type == "text").strip()

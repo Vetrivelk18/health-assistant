@@ -1,6 +1,6 @@
 """
 Tests for the MCP tool endpoints (routes/mcp_tools.py).
-Mocks calls to Claude and to Google's token endpoint.
+Mocks calls to Gemini and to Google's token endpoint.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -64,9 +64,9 @@ def test_query_unknown_user_returns_404():
     assert response.status_code == 404
 
 
-def test_query_connected_user_returns_claude_answer(connected_user):
+def test_query_connected_user_returns_gemini_answer(connected_user):
     with patch(
-        "routes.mcp_tools.claude.answer_health_query",
+        "routes.mcp_tools.gemini.answer_health_query",
         new=AsyncMock(return_value="You slept 7 hours last night."),
     ):
         response = client.post(
@@ -96,7 +96,7 @@ def test_query_refreshes_expiring_token(connected_user):
         "routes.mcp_tools.google_health_client.refresh",
         new=AsyncMock(return_value=fresh_bundle),
     ), patch(
-        "routes.mcp_tools.claude.answer_health_query",
+        "routes.mcp_tools.gemini.answer_health_query",
         new=AsyncMock(return_value="ok"),
     ) as mock_answer:
         response = client.post(
