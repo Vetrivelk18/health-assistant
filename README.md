@@ -11,12 +11,15 @@ An intelligent, app-less health assistant that connects your Fitbit or Pixel Wat
 > function-calling loop work end-to-end (`gemini-2.5-flash-lite` 404s as "no
 > longer available to new users"; the default is `gemini-3.5-flash-lite`).
 > The `/api/health` endpoints are not built yet — see the project structure
-> below. The one open item on the Google Health API client itself is the
-> `filter` query grammar for fetching data points, which still needs a real
-> account run through the probe script — see
-> [Google Health API migration](#google-health-api-migration). Deployment
-> (Cloud Run + Cloud Scheduler + Neon) is documented in
-> [`DEPLOY.md`](DEPLOY.md).
+> below. The Google Health API `filter` grammar is now confirmed against a
+> real account and baked into `FILTER_TEMPLATE_BY_TYPE` — see
+> [Google Health API migration](#google-health-api-migration) — but that same
+> probe run returned zero data points for every type over a 30-day window, so
+> either the connected Google account has no Fitbit/Pixel Watch actively
+> syncing to it, or there's a wearable-linkage step still missing; `calories`
+> is separately and permanently broken via this client (`total-calories` only
+> supports `rollup`/`dailyRollUp`, not `list`). Deployment (Cloud Run + Cloud
+> Scheduler + Neon) is documented in [`DEPLOY.md`](DEPLOY.md).
 
 ## Architecture
 
@@ -141,13 +144,28 @@ python -c "from database import init_db; init_db()"
 `services/google_health.py` was rewritten to target `health.googleapis.com`
 instead of the old `fitness.googleapis.com` (Google Fit) endpoints, and
 `routes/auth.py`/`config.py` have been updated to match the new
-`GoogleHealthClient` interface. What's still open:
+`GoogleHealthClient` interface.
 
-1. Run the standalone probe script to confirm the API returns real data for
-   your account and to discover the working filter grammar — see
-   [`README_PROBE.md`](README_PROBE.md).
-2. Once the probe reports a working filter, set `FILTER_TEMPLATE_IN_USE` in
-   `services/google_health.py` per the script's instructions.
+The `filter` grammar is confirmed (run against a real account via
+`probe_health_api.py` on 2026-08-22 — see [`README_PROBE.md`](README_PROBE.md))
+and is **per data type**, not one shared grammar — each restricts on a
+different member path, always prefixed with the type's snake_case name:
+
+| Type | Member path |
+|---|---|
+| `sleep` | `sleep.interval.end_time` |
+| `steps` | `steps.interval.start_time` |
+| `heart-rate` | `heart_rate.sample_time.physical_time` |
+| `active-minutes` | `active_minutes.interval.start_time` |
+| `total-calories` | none — `list` 400s unconditionally; only `rollup`/`dailyRollUp` are supported, which this client doesn't implement |
+
+`FILTER_TEMPLATE_BY_TYPE` in `services/google_health.py` holds these, and
+`list_data_points` applies the right one automatically — no per-call setup
+needed. What's still open: that same probe run returned zero data points for
+every type over a 30-day window against the connected test account, so the
+plumbing is confirmed correct but real device data hasn't been confirmed yet
+— re-run `probe_health_api.py` against an account with a Fitbit/Pixel Watch
+that's synced recently.
 
 ### 6. Telegram Bot Setup
 

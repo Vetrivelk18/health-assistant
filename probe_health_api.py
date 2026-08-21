@@ -51,7 +51,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from services.google_health import (  # noqa: E402
-    DATA_TYPES, FILTER_TEMPLATES, GoogleHealthClient, GoogleHealthError,
+    DATA_TYPES, FILTER_TEMPLATE_BY_TYPE, GoogleHealthClient, GoogleHealthError,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -237,32 +237,23 @@ async def main() -> None:
     say(f"  granted scope : {tokens.scope or '(not reported)'}", "d")
 
     # ---- probe every data type ----
+    # Filter grammar is confirmed and per-type (FILTER_TEMPLATE_BY_TYPE in
+    # services/google_health.py) — list_data_points applies it automatically,
+    # so this just verifies each type actually returns data for the account.
     yesterday = date.today() - timedelta(days=1)
     say(f"\nProbing data types for {yesterday} …\n", "b")
 
-    working_filter: str | None = None
     rows: list[tuple[str, str, str]] = []
 
     for friendly, path in DATA_TYPES.items():
-        attempts = ([working_filter] if working_filter else []) + [None] + FILTER_TEMPLATES
         result, note = None, ""
-
-        for tpl in attempts:
-            try:
-                result = await client.list_data_points(
-                    tokens.access_token, path, yesterday, yesterday,
-                    filter_template=tpl,
-                )
-                if tpl and working_filter is None:
-                    working_filter = tpl
-                note = "no filter" if tpl is None else "filtered"
-                break
-            except GoogleHealthError as e:
-                note = str(e.status)
-                if e.status in (401, 403):
-                    (FIXTURES / f"{friendly}.error.txt").write_text(e.body)
-                    break  # auth/scope problem — other filters won't help
-                continue
+        try:
+            result = await client.list_data_points(tokens.access_token, path, yesterday, yesterday)
+            note = "filtered" if path in FILTER_TEMPLATE_BY_TYPE else "unfiltered (no template for this type)"
+        except GoogleHealthError as e:
+            note = str(e.status)
+            if e.status in (401, 403):
+                (FIXTURES / f"{friendly}.error.txt").write_text(e.body)
 
         if result is None:
             rows.append((friendly, C["r"] + "FAIL" + C["x"], note))
@@ -281,12 +272,6 @@ async def main() -> None:
     for name, mark, note in rows:
         print(f"{name:<18}{mark:<33}{C['d']}{note}{C['x']}", flush=True)
     say("=" * 58, "b")
-
-    if working_filter:
-        say(f"\nWorking filter grammar:\n  {working_filter}", "g")
-        say("Set FILTER_TEMPLATE_IN_USE in services/google_health.py to this.", "d")
-    else:
-        say("\nNo filter grammar accepted — unfiltered requests only for now.", "y")
 
     got = [r for r in rows if "points" in r[1]]
     say(f"\nFixtures written to {FIXTURES}/", "d")
