@@ -51,6 +51,25 @@ class Settings:
     RUN_DAILY_AUDIENCE: str = os.getenv("RUN_DAILY_AUDIENCE")  # the deployed Cloud Run service URL
     SCHEDULER_SERVICE_ACCOUNT_EMAIL: str = os.getenv("SCHEDULER_SERVICE_ACCOUNT_EMAIL")
 
+    # Cloud Tasks fan-out: /internal/run-daily enqueues one task per user
+    # instead of processing the whole batch inline. Tasks call back into
+    # /internal/run-single-user carrying their own OIDC token, verified the
+    # same way. First 1M operations/month are free. See DEPLOY.md.
+    #
+    # TASKS_QUEUE unset (the local-dev default) makes /internal/run-daily
+    # fall back to running the batch inline, so the endpoint still works
+    # without a queue to talk to.
+    TASKS_QUEUE: str = os.getenv("TASKS_QUEUE")
+    TASKS_LOCATION: str = os.getenv("TASKS_LOCATION", "us-central1")
+    # Base URL tasks are delivered to — defaults to the same Cloud Run
+    # service URL the scheduler already targets.
+    TASKS_TARGET_BASE_URL: str = os.getenv("TASKS_TARGET_BASE_URL", os.getenv("RUN_DAILY_AUDIENCE"))
+    # Service account Cloud Tasks mints its OIDC tokens as. Defaults to the
+    # scheduler's, so a single SA works if you don't want to split them.
+    TASKS_SERVICE_ACCOUNT_EMAIL: str = os.getenv(
+        "TASKS_SERVICE_ACCOUNT_EMAIL", os.getenv("SCHEDULER_SERVICE_ACCOUNT_EMAIL")
+    )
+
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 

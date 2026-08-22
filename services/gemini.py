@@ -25,13 +25,41 @@ import logging
 from datetime import date, timedelta
 from typing import Any
 
+import httpx
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 from config import settings
 from services.google_health import DATA_TYPES, GoogleHealthClient, GoogleHealthError
 
 logger = logging.getLogger(__name__)
+
+
+class GeminiError(RuntimeError):
+    """A Gemini call failed. `is_transient` says whether a retry could help."""
+
+    def __init__(self, message: str, *, is_transient: bool):
+        super().__init__(message)
+        self.is_transient = is_transient
+
+
+def _wrap_api_error(e: Exception) -> GeminiError:
+    """Classify an SDK exception so callers don't have to know the SDK.
+
+    ServerError (5xx) and network failures are worth retrying. So is 429 —
+    the free tier rate-limits, and the daily run bursts. A 400 (malformed
+    request) or 403 (bad key) never will be.
+    """
+    if isinstance(e, genai_errors.ServerError):
+        return GeminiError(f"Gemini server error: {e}", is_transient=True)
+    if isinstance(e, genai_errors.ClientError):
+        code = getattr(e, "code", None)
+        return GeminiError(f"Gemini client error ({code}): {e}", is_transient=code == 429)
+    if isinstance(e, httpx.HTTPError):
+        return GeminiError(f"Gemini network error: {type(e).__name__}: {e}", is_transient=True)
+    return GeminiError(f"Gemini call failed: {type(e).__name__}: {e}", is_transient=False)
+
 
 # Constructed lazily-but-once: genai.Client raises immediately if api_key is
 # falsy, so an unset key must not crash module import (routes/tests import
@@ -122,15 +150,24 @@ def _require_client() -> genai.Client:
 
 
 async def generate_daily_summary(day_data: dict[str, Any]) -> str:
-    response = await _require_client().aio.models.generate_content(
-        model=settings.GEMINI_MODEL,
-        contents=f"Today's health data:\n\n{json.dumps(day_data, indent=2)}",
-        config=types.GenerateContentConfig(
-            system_instruction=DAILY_SUMMARY_SYSTEM_PROMPT,
-            max_output_tokens=MAX_TOKENS,
-        ),
-    )
-    return (response.text or "").strip()
+    try:
+        response = await _require_client().aio.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=f"Today's health data:\n\n{json.dumps(day_data, indent=2)}",
+            config=types.GenerateContentConfig(
+                system_instruction=DAILY_SUMMARY_SYSTEM_PROMPT,
+                max_output_tokens=MAX_TOKENS,
+            ),
+        )
+    except Exception as e:
+        raise _wrap_api_error(e) from e
+
+    text = (response.text or "").strip()
+    if not text:
+        # An empty completion (safety filter, or the token cap hit mid-first-
+        # token) would otherwise be stored and sent as a blank message.
+        raise GeminiError("Gemini returned an empty summary", is_transient=True)
+    return text
 
 
 async def answer_health_query(
@@ -148,15 +185,18 @@ async def answer_health_query(
     ]
 
     for _ in range(max_tool_iterations):
-        response = await client.aio.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=QUERY_SYSTEM_PROMPT,
-                max_output_tokens=MAX_TOKENS,
-                tools=tools,
-            ),
-        )
+        try:
+            response = await client.aio.models.generate_content(
+                model=settings.GEMINI_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=QUERY_SYSTEM_PROMPT,
+                    max_output_tokens=MAX_TOKENS,
+                    tools=tools,
+                ),
+            )
+        except Exception as e:
+            raise _wrap_api_error(e) from e
 
         calls = response.function_calls
         if not calls:
