@@ -7,8 +7,16 @@ Instructions for coding agents (Claude Code, etc.) working in this repo.
 FastAPI backend that reads Fitbit/Pixel Watch data through the **Google
 Health API** (`health.googleapis.com`), summarizes it with Gemini, and
 delivers it over a Telegram bot. Production target is Cloud Run + Cloud
-Scheduler + Neon Postgres — see `DEPLOY.md`. See `README.md` for the full
-architecture and setup instructions.
+Scheduler + Cloud Tasks + Neon Postgres — see `DEPLOY.md`. See `README.md`
+for the full architecture and setup instructions.
+
+**Cost is a hard constraint on this project.** Every infrastructure choice
+defaults to a free tier and scale-to-zero. Before proposing anything that
+adds a component, state its cost — and prefer the free option even when it's
+less convenient. Avoid always-on resources (idle VMs, provisioned DB
+instances, load balancers, Redis) unless explicitly asked for. This is why
+there's no in-process scheduler, why `--min-instances=0`, and why OAuth
+state lives in a process dict rather than a Redis instance.
 
 ## Current state — read before touching OAuth or the Health API client
 
@@ -55,10 +63,11 @@ chasing.
 
 `routes/telegram.py` (webhook: `/start`, `/connect`, `/disconnect`,
 `/status`, plus plain-text queries routed through `services/gemini.py`) and
-`routes/internal.py` (`POST /internal/run-daily`, called by Cloud Scheduler)
-are built and wired in. `routes/health.py` (the separate `/api/health/*`
-endpoints, distinct from the existing `GET /health` liveness check) doesn't
-exist yet.
+`routes/internal.py` (`POST /internal/run-daily` called by Cloud Scheduler,
+which fans out over Cloud Tasks to `POST /internal/run-single-user` —
+see the Gotchas below) are built and wired in. `routes/health.py` (the
+separate `/api/health/*` endpoints, distinct from the existing `GET /health`
+liveness check) doesn't exist yet.
 
 The `filter` query grammar for `GET /v4/.../dataPoints` is confirmed (ran
 `probe_health_api.py` against a real account, 2026-08-22 — standalone, no
@@ -85,6 +94,15 @@ scopes, filter grammar) is confirmed correct, but no actual device data has
 been confirmed yet. Re-run `probe_health_api.py` against an account with a
 Fitbit/Pixel Watch that's synced recently before assuming this is a code
 bug.
+
+The daily run was reworked on 2026-08-22/23 into a **Cloud Tasks fan-out**
+(`services/tasks.py` + a dispatcher/worker split in `routes/internal.py`),
+with failure classification across every outbound call and structured JSON
+logging (`utils/logging_config.py`). The Gotchas section below covers the
+non-obvious parts — read it before changing `routes/internal.py`,
+`services/tasks.py`, or any error handling. All of it is **test-verified but
+not yet deployed**: the queue, its IAM bindings and the log-based metric in
+`DEPLOY.md` §5–6 have not been created in a real GCP project.
 
 ## Commands
 
@@ -135,10 +153,66 @@ python3 probe_health_api.py
   alive between requests, so anything like APScheduler (previously listed in
   `requirements.txt`, never actually wired up) would silently never fire.
   The daily job is triggered externally — Cloud Scheduler calls
-  `POST /internal/run-daily` and the whole run (refresh → fetch → summarise
-  → store → send) happens synchronously inside that one request. Don't defer
-  any of it with a background task — Cloud Run freezes CPU the instant the
-  response is sent, so anything deferred past that point never completes.
+  `POST /internal/run-daily`. Don't defer work with a background task —
+  Cloud Run freezes CPU the instant the response is sent, so anything
+  deferred past that point never completes. Cloud Tasks is the supported way
+  to get a "later" here.
+- **The daily run fans out over Cloud Tasks**: `/internal/run-daily` no
+  longer does per-user work. It enqueues one task per connected user and
+  returns in well under a second; Cloud Tasks dispatches those back to
+  `POST /internal/run-single-user` at ~5/sec, one short request each. Keep
+  it that way — if the dispatcher starts calling Gemini or Telegram itself,
+  the queue's whole purpose (flat memory, short requests, scale-to-zero
+  between users) is gone. `tests/test_internal.py` asserts the dispatcher
+  makes no outbound calls.
+- **Retry semantics on `/run-single-user`**: Cloud Tasks retries *any*
+  non-2xx. So permanent failures (no token on file, dead refresh token)
+  return **200** with a failure body — retrying can't help and would burn
+  all five attempts — while transient ones (Gemini, Telegram, Health API
+  5xx/429) return **503** to earn a backed-off retry. `_summarise_user`
+  returns a `retryable` flag rather than raising, so the inline path and the
+  task path can each decide what to do with the same outcome.
+- **Idempotency has three layers**, because a retried task must never send a
+  second summary: deterministic Cloud Tasks names
+  (`daily-{user_id}-{date}`) dedupe at the queue, `/run-single-user`
+  re-checks `last_summary_sent` before doing work, and the `HealthSummary`
+  write is an upsert on `(user_id, summary_date)` so a retry after a
+  Telegram failure updates the existing row instead of piling up duplicates.
+- **`services/tasks.py` imports `google.cloud` inside its functions**, not
+  at module scope. That's deliberate: it keeps grpcio's slow import off
+  every cold start (most are Telegram webhooks that never enqueue), and
+  keeps the module importable without Application Default Credentials, which
+  don't exist on a dev laptop or in CI.
+- **Without `TASKS_QUEUE` set, `/run-daily` runs the batch inline** and logs
+  a warning. That's the local-dev and test path; the response's `"mode"`
+  field says which path ran (`"queued"` vs `"inline"`).
+- **Every outbound call fails into a *classified* error.** `GoogleHealthError`
+  has `.is_transient`, `GeminiError` has `.is_transient`, and `TelegramError`
+  carries `.error_code`. Network failures are wrapped at the source —
+  `httpx.HTTPError` becomes `GoogleHealthError(status=0)` or a
+  `TelegramError` — so a timeout can't escape past an `except
+  GoogleHealthError` clause. If you add an outbound call, wrap it the same
+  way; an unclassified exception defaults to non-retryable and silently
+  drops that user's summary for the day.
+- **`is_total_outage()` distinguishes "watch was off" from "API is down".**
+  Both produce a day with no metrics, because `fetch_day` swallows per-type
+  errors by design. Only the first should become a summary — telling someone
+  they logged nothing when Google was down is worse than being late. Don't
+  "simplify" this check away; `tests/test_reliability.py` pins the four
+  cases (empty-but-OK, all-transient, partial, all-permanent).
+- **`total-calories` is excluded from the outage check** because it fails
+  permanently by design. Counting it would make a real outage undetectable.
+- **Structured logs, not f-strings, for anything operational.** Use
+  `log_event(logger, level, msg, event=..., user_id=..., ...)` from
+  `utils/logging_config.py` — those kwargs become queryable
+  `jsonPayload` fields in Cloud Logging. A message with the user id
+  interpolated into the string can only be grepped. Existing event names are
+  listed in `DEPLOY.md` §6; reuse them rather than inventing variants.
+- **Retry budgets are bounded, and both defaults were unlimited.** Cloud
+  Tasks (`--max-attempts=3`) and Cloud Scheduler (`--max-retry-attempts=3`)
+  both default to retrying forever, which for a daily job means a
+  permanently broken user burns quota and Gemini tokens indefinitely. The
+  endpoint's 200-vs-503 classification is what makes a small budget safe.
 - **`/internal/run-daily` auth**: the Cloud Run service is deployed
   `--allow-unauthenticated` (Telegram has to reach the webhook), so this one
   endpoint verifies the Google-signed OIDC token Cloud Scheduler sends
