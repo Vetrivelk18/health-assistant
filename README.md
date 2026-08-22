@@ -4,8 +4,16 @@ An intelligent, app-less health assistant that connects your Fitbit or Pixel Wat
 
 > **Status:** OAuth (`routes/auth.py`), the Gemini tool-use query pipeline
 > (`services/gemini.py` + `routes/mcp_tools.py`), the Telegram webhook
-> (`routes/telegram.py` + `services/telegram_bot.py`), and the Cloud
-> Scheduler daily-run endpoint (`routes/internal.py`) are built and wired up.
+> (`routes/telegram.py` + `services/telegram_bot.py`), and the daily-run
+> endpoints (`routes/internal.py`) are built and wired up.
+>
+> The daily run now **fans out over Cloud Tasks** — `/internal/run-daily`
+> enqueues one task per user and returns immediately, and Cloud Tasks
+> dispatches each back to `/internal/run-single-user` at a capped rate.
+> Failures are classified transient vs. permanent so bounded retry budgets
+> are spent only on problems that might resolve, and logs are structured
+> JSON for Cloud Logging. See [`DEPLOY.md`](DEPLOY.md).
+>
 > The Gemini integration has been exercised against the live API with a real
 > key — both `generate_daily_summary` and the `answer_health_query`
 > function-calling loop work end-to-end (`gemini-2.5-flash-lite` 404s as "no
@@ -18,8 +26,13 @@ An intelligent, app-less health assistant that connects your Fitbit or Pixel Wat
 > either the connected Google account has no Fitbit/Pixel Watch actively
 > syncing to it, or there's a wearable-linkage step still missing; `calories`
 > is separately and permanently broken via this client (`total-calories` only
-> supports `rollup`/`dailyRollUp`, not `list`). Deployment (Cloud Run + Cloud
-> Scheduler + Neon) is documented in [`DEPLOY.md`](DEPLOY.md).
+> supports `rollup`/`dailyRollUp`, not `list`).
+>
+> **Not yet deployed or run against real infrastructure.** The Cloud Tasks
+> fan-out, retry policies and structured logging are covered by tests
+> (65 passing) but the queue, its IAM bindings and the log-based metric have
+> not been created in a real project — `DEPLOY.md` §5–6 are written, not
+> executed.
 
 ## Architecture
 
@@ -30,7 +43,9 @@ Telegram Bot → FastAPI Backend (Cloud Run) → Google Health API (health.googl
                     ↓
          get_health_metric tool call
 
-Cloud Scheduler → POST /internal/run-daily (OIDC-authenticated) → daily summary per user
+Cloud Scheduler → POST /internal/run-daily (OIDC-authenticated)
+                       → enqueues 1 Cloud Task per user, returns in <1s
+                       → Cloud Tasks (≤5/sec) → POST /internal/run-single-user
 ```
 
 ## Features
@@ -39,6 +54,13 @@ Cloud Scheduler → POST /internal/run-daily (OIDC-authenticated) → daily summ
 - **Interactive Queries**: Ask questions like "How was my deep sleep?" and get AI-powered answers
 - **OAuth 2.0 Security**: Secure Google Health API integration
 - **Telegram Interface**: No separate app needed
+- **Graceful degradation**: A metric that fails still yields a summary from
+  the rest of the data — but a full API outage retries rather than claiming
+  you logged nothing
+- **Bounded retries**: Failures are classified transient vs. permanent, so
+  retry budgets are spent only on problems that might actually resolve
+- **Structured logging**: JSON logs with per-user fields, queryable in Cloud
+  Logging (see [`DEPLOY.md`](DEPLOY.md#6-logging--observability))
 
 ## Project Structure
 
@@ -52,7 +74,7 @@ Cloud Scheduler → POST /internal/run-daily (OIDC-authenticated) → daily summ
 ├── Dockerfile                # Cloud Run container build
 ├── .env.example              # Environment template
 ├── README.md                 # This file
-├── DEPLOY.md                 # Cloud Run + Cloud Scheduler + Neon deployment guide
+├── DEPLOY.md                 # Cloud Run + Scheduler + Tasks + Neon deployment guide
 ├── AGENTS.md                 # Instructions for coding agents working in this repo
 ├── PHASE2_OAUTH.md           # Notes from the OAuth build-out
 ├── README_PROBE.md           # How to run the standalone API probe script
@@ -62,13 +84,17 @@ Cloud Scheduler → POST /internal/run-daily (OIDC-authenticated) → daily summ
 │   ├── auth.py              # OAuth 2.0 login/callback (built)
 │   ├── mcp_tools.py         # Tool schema + interactive query endpoint (built)
 │   ├── telegram.py          # Telegram webhook handler (built)
-│   ├── internal.py          # POST /internal/run-daily, called by Cloud Scheduler (built)
+│   ├── internal.py          # Daily-run dispatcher + per-user worker (built)
 │   └── health.py            # Health data endpoints (not built yet)
 │
 ├── services/                # Business logic
 │   ├── google_health.py     # Google Health API client (built)
 │   ├── gemini.py            # Gemini integration + function-calling loop (built)
+│   ├── tasks.py             # Cloud Tasks fan-out for the daily run (built)
 │   └── telegram_bot.py      # Telegram bot helper (built)
+│
+├── utils/
+│   └── logging_config.py    # Structured JSON logging for Cloud Logging
 │
 └── tests/                   # Test suite
     └── test_*.py
@@ -205,9 +231,14 @@ uvicorn app:app --reload
   (routed through the same Gemini/MCP query pipeline as `/mcp/query`).
 
 ### Internal (built)
-- `POST /internal/run-daily` - Generate and deliver the daily summary for
-  every connected user. Called by Cloud Scheduler; verifies a Google-signed
-  OIDC token rather than being open to the public. See [`DEPLOY.md`](DEPLOY.md).
+- `POST /internal/run-daily` - Called by Cloud Scheduler. Enqueues one Cloud
+  Task per connected user and returns immediately. Falls back to running the
+  batch inline when `TASKS_QUEUE` is unset (local dev).
+- `POST /internal/run-single-user` - Called by Cloud Tasks, once per user.
+  Generates, stores and delivers that user's summary.
+
+Both verify a Google-signed OIDC token rather than being open to the public.
+See [`DEPLOY.md`](DEPLOY.md).
 
 ### Health Check (built)
 - `GET /health` - Service status; returns 503 if the database is unreachable
@@ -277,16 +308,32 @@ docker run -p 8080:8080 --env-file .env -e PORT=8080 health-assistant
 Cloud Scheduler (07:00 in each region's config) → POST /internal/run-daily
        → Verify Google-signed OIDC token (audience + service-account email)
        → For each connected user:
-           Refresh OAuth token if needed
-           Fetch sleep/activity/heart rate data for "yesterday" in the
-             user's own timezone (not the container's UTC clock)
-           Pass to Gemini with system prompt → 3-bullet markdown summary
-           Store the summary row
-           Send to Telegram (a delivery failure here is logged, not
-             thrown away — the stored summary survives it)
-       → Respond to Cloud Scheduler (all synchronous; nothing deferred
-         past the response, since Cloud Run freezes CPU after that point)
+           Skip if already summarised for their "yesterday"
+           Enqueue one Cloud Task, named daily-{user_id}-{date}
+       → Respond immediately (no per-user work happens here)
+
+Cloud Tasks (dispatch capped at 5/sec) → POST /internal/run-single-user
+       → Verify OIDC token, re-check last_summary_sent (idempotency)
+       → Refresh OAuth token if needed
+       → Fetch sleep/activity/heart rate data for "yesterday" in the
+           user's own timezone (not the container's UTC clock)
+       → Pass to Gemini with system prompt → 3-bullet markdown summary
+       → Upsert the summary row
+       → Send to Telegram (a delivery failure here is logged, not thrown
+           away — the stored summary survives it)
+       → 200 if done or permanently failed; 503 if worth retrying
 ```
+
+The fan-out is what keeps this free. Doing the whole batch inline held one
+instance's CPU and RAM for the entire run and risked blowing the Scheduler
+attempt deadline; one short request per user keeps peak memory flat
+regardless of user count and lets Cloud Run scale to zero in between. Cloud
+Tasks' first 1M operations/month are free — see the cost table in
+[`DEPLOY.md`](DEPLOY.md#9-cost-what-actually-stays-free).
+
+Every step is synchronous within its own request: Cloud Run freezes CPU the
+instant a response is sent, so the queue provides the "later", never a
+background task.
 
 ### Interactive Query Pipeline
 

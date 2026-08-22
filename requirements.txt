@@ -20,10 +20,12 @@ sqlalchemy==2.0.23
 psycopg2-binary==2.9.9
 alembic==1.13.1
 
-# Task Scheduling: none. Cloud Run containers don't stay alive between
-# requests, so an in-process scheduler would silently never fire — the daily
-# job is triggered externally by Cloud Scheduler calling POST
-# /internal/run-daily instead. See DEPLOY.md.
+# Task Scheduling: no in-process scheduler. Cloud Run containers don't stay
+# alive between requests, so one would silently never fire — Cloud Scheduler
+# calls POST /internal/run-daily instead, which fans the batch out over
+# Cloud Tasks (one task per user) rather than processing it inline.
+# First 1M Cloud Tasks operations/month are free. See DEPLOY.md.
+google-cloud-tasks==2.16.3
 
 # Token Management & Security
 pyjwt==2.8.0
@@ -38,8 +40,11 @@ python-dotenv==1.0.0
 httpx==0.28.1
 requests==2.31.0
 
-# Logging
-python-json-logger==2.0.7
+# Logging: no dependency. Cloud Logging wants a specific JSON shape
+# (`severity`, `message`, everything else into jsonPayload) that
+# python-json-logger doesn't emit without subclassing its formatter anyway —
+# at which point stdlib `logging` + `json` is the smaller thing to maintain.
+# See utils/logging_config.py.
 
 # Type Hints & Validation
 pydantic==2.9.2

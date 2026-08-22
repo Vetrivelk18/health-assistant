@@ -3,19 +3,26 @@ AI Health Assistant - Main FastAPI Application
 Integrates Google Health API, Gemini AI, and Telegram Bot
 """
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import logging
 import os
 from dotenv import load_dotenv
 from sqlalchemy import text
 
+from utils.logging_config import configure_logging, log_event
+
 # Load environment variables
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+# Structured JSON logs in production so Cloud Logging parses severity and
+# per-user fields; human-readable lines locally. See utils/logging_config.py.
+configure_logging(
+    os.getenv("LOG_LEVEL", "INFO"),
+    structured=os.getenv("FASTAPI_ENV", "development") != "development",
+)
 logger = logging.getLogger(__name__)
 
 # Import routers
@@ -50,6 +57,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Last line of defence: log unhandled exceptions with a stack trace and
+    the request path attached, then return a generic 500.
+
+    Without this, an unhandled exception is logged by uvicorn as a bare
+    traceback with no request context — and the exception text can leak
+    internals (connection strings, tokens) into the response body.
+    """
+    log_event(
+        logger,
+        logging.ERROR,
+        f"Unhandled exception on {request.method} {request.url.path}",
+        exc_info=True,
+        event="unhandled_exception",
+        path=request.url.path,
+        method=request.method,
+        error_type=type(exc).__name__,
+    )
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
 
 # Health check endpoint
 @app.get("/health")

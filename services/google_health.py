@@ -94,14 +94,35 @@ FILTER_TEMPLATE_BY_TYPE: dict[str, str] = {
 }
 
 
+# Status code used for "the request never got a response at all" — a DNS
+# failure, connection reset or timeout. Not a real HTTP status; it exists so
+# every failure out of this client is a GoogleHealthError and callers only
+# need one except clause.
+NETWORK_ERROR_STATUS = 0
+
+
 class GoogleHealthError(RuntimeError):
-    """Raised when the Health API returns a non-2xx response."""
+    """Raised when the Health API fails — a non-2xx response, or no response."""
 
     def __init__(self, status: int, body: str, url: str):
         super().__init__(f"{status} from {url}: {body[:400]}")
         self.status = status
         self.body = body
         self.url = url
+
+    @property
+    def is_transient(self) -> bool:
+        """Whether retrying this later could plausibly succeed.
+
+        Server errors, rate limits and network failures are worth a retry.
+        A 400 (bad filter grammar) or 403 (missing scope) is a bug or a
+        consent problem — retrying just burns the budget.
+        """
+        return (
+            self.status == NETWORK_ERROR_STATUS
+            or self.status == 429
+            or self.status >= 500
+        )
 
 
 @dataclass
@@ -150,27 +171,34 @@ class GoogleHealthClient:
         }
         return f"{AUTH_URI}?{urlencode(params)}"
 
+    async def _post_token(self, data: dict[str, str]) -> httpx.Response:
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as c:
+                return await c.post(TOKEN_URI, data=data)
+        except httpx.HTTPError as e:
+            raise GoogleHealthError(
+                NETWORK_ERROR_STATUS, f"{type(e).__name__}: {e}", TOKEN_URI
+            ) from e
+
     async def exchange_code(self, code: str) -> TokenBundle:
-        async with httpx.AsyncClient(timeout=self.timeout) as c:
-            r = await c.post(TOKEN_URI, data={
-                "code": code,
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "redirect_uri": self.redirect_uri,
-                "grant_type": "authorization_code",
-            })
+        r = await self._post_token({
+            "code": code,
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "redirect_uri": self.redirect_uri,
+            "grant_type": "authorization_code",
+        })
         if r.status_code >= 400:
             raise GoogleHealthError(r.status_code, r.text, TOKEN_URI)
         return self._bundle(r.json())
 
     async def refresh(self, refresh_token: str) -> TokenBundle:
-        async with httpx.AsyncClient(timeout=self.timeout) as c:
-            r = await c.post(TOKEN_URI, data={
-                "refresh_token": refresh_token,
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "grant_type": "refresh_token",
-            })
+        r = await self._post_token({
+            "refresh_token": refresh_token,
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "grant_type": "refresh_token",
+        })
         if r.status_code >= 400:
             # invalid_grant here usually means the consent screen is still in
             # "Testing", where refresh tokens expire after seven days.
@@ -224,9 +252,16 @@ class GoogleHealthClient:
                 end_rfc=f"{(end + timedelta(days=1)).isoformat()}T00:00:00Z",
             )
 
-        async with httpx.AsyncClient(timeout=self.timeout) as c:
-            r = await c.get(url, params=params,
-                            headers={"Authorization": f"Bearer {access_token}"})
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as c:
+                r = await c.get(url, params=params,
+                                headers={"Authorization": f"Bearer {access_token}"})
+        except httpx.HTTPError as e:
+            # A timeout or connection reset otherwise escapes as a raw httpx
+            # exception, past every `except GoogleHealthError` in the app.
+            raise GoogleHealthError(
+                NETWORK_ERROR_STATUS, f"{type(e).__name__}: {e}", url
+            ) from e
 
         if r.status_code >= 400:
             raise GoogleHealthError(r.status_code, r.text, str(r.request.url))
@@ -238,6 +273,8 @@ class GoogleHealthClient:
 
         A failure on one data type does not sink the others — a missing metric
         produces a shorter summary, which is the documented degradation path.
+        Each recorded error carries `transient`, so a caller can tell a real
+        gap in the data from an outage that's worth retrying.
         """
         out: dict[str, Any] = {"date": day.isoformat(), "metrics": {}, "errors": {}}
 
@@ -248,6 +285,34 @@ class GoogleHealthClient:
                 )
             except GoogleHealthError as e:
                 logger.warning("fetch %s failed: %s", friendly, e)
-                out["errors"][friendly] = {"status": e.status, "body": e.body[:400]}
+                out["errors"][friendly] = {
+                    "status": e.status,
+                    "body": e.body[:400],
+                    "transient": e.is_transient,
+                }
 
         return out
+
+
+def is_total_outage(day_data: dict[str, Any]) -> bool:
+    """True when every data type failed and at least one failure was transient.
+
+    This is the distinction that decides whether a thin day is real. A watch
+    left on the charger returns 200s with empty point lists — genuinely no
+    data, and "you didn't log anything yesterday" is the correct summary. An
+    API outage returns nothing but 5xx, which looks identical downstream once
+    the errors are swallowed. Sending "no data yesterday" in that case tells
+    the user something false about their own health, so the caller should
+    retry instead.
+
+    `total-calories` is excluded: it fails permanently by design (list isn't
+    supported on it), so counting it would make a total outage impossible to
+    detect.
+    """
+    errors = day_data.get("errors", {})
+    retryable = {k: v for k, v in errors.items() if k != "calories"}
+    expected = {k for k in DATA_TYPES if k != "calories"}
+
+    if set(retryable) != expected:
+        return False  # at least one type came back — partial data is usable
+    return any(e.get("transient") for e in retryable.values())
