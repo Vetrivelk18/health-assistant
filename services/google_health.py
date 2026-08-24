@@ -32,6 +32,8 @@ shape (a different HTTP method/body, not just a filter).
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -52,8 +54,17 @@ REVOKE_URI = "https://oauth2.googleapis.com/revoke"
 
 HEALTH_BASE = "https://health.googleapis.com/v4"
 
-# Scopes are Restricted. Request only what the product actually reads.
+# The googlehealth.* scopes are Restricted. Request only what the product
+# actually reads.
+#
+# `openid` and `email` are non-sensitive and add no verification burden;
+# they're what make the token response carry an id_token, which is how we
+# learn the user's real Google account id and address. Without them the
+# only identity available is the Telegram chat id, and the users table has
+# unique constraints on both google_user_id and email.
 SCOPES = [
+    "openid",
+    "email",
     "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
     "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
@@ -131,11 +142,36 @@ class TokenBundle:
     refresh_token: str | None
     expires_at: datetime
     scope: str = ""
+    # From the id_token, when the openid/email scopes were granted. None on
+    # a plain refresh, which doesn't reissue an id_token.
+    google_user_id: str | None = None
+    email: str | None = None
 
     @property
     def is_expiring_soon(self) -> bool:
         # Refresh proactively so a request never fails on a stale token.
         return datetime.now(timezone.utc) >= self.expires_at - timedelta(minutes=5)
+
+
+def decode_id_token_claims(id_token: str) -> dict[str, Any]:
+    """Read the claims out of an id_token without verifying the signature.
+
+    Safe *specifically here* because this token came straight back from
+    Google's token endpoint over an authenticated TLS connection, which
+    Google's own documentation names as the case where verification can be
+    skipped. Anything arriving from a client instead must be verified with
+    google.oauth2.id_token.verify_oauth2_token.
+
+    Returns {} rather than raising: identity is useful metadata, not
+    something worth failing an otherwise successful connection over.
+    """
+    try:
+        payload_b64 = id_token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)  # restore stripped padding
+        return json.loads(base64.urlsafe_b64decode(payload_b64))
+    except (IndexError, ValueError, json.JSONDecodeError) as e:
+        logger.warning("Could not decode id_token claims: %s", e)
+        return {}
 
 
 # --------------------------------------------------------------------------
@@ -213,12 +249,17 @@ class GoogleHealthClient:
 
     @staticmethod
     def _bundle(data: dict[str, Any]) -> TokenBundle:
+        # id_token is present on the initial code exchange (given the openid
+        # scope) but not on a refresh, so these stay None there.
+        claims = decode_id_token_claims(data["id_token"]) if data.get("id_token") else {}
         return TokenBundle(
             access_token=data["access_token"],
             refresh_token=data.get("refresh_token"),
             expires_at=datetime.now(timezone.utc)
                        + timedelta(seconds=int(data.get("expires_in", 3600))),
             scope=data.get("scope", ""),
+            google_user_id=claims.get("sub"),
+            email=claims.get("email"),
         )
 
     # ---------------- Data ----------------
