@@ -284,8 +284,12 @@ async def _summarise_user(user: User, target_day: date, db: Session) -> dict:
     # Only the first should become a summary; telling a user "you logged
     # nothing yesterday" because Google was down is worse than being late.
     if is_total_outage(day_data):
+        # report=True: every metric failing means the Health API (or our
+        # access to it) is broken for everyone, not just this user — worth
+        # surfacing in Error Reporting. Per-user failures deliberately are
+        # not, or an expired consent would page someone every morning.
         log_event(logger, logging.ERROR, f"All health metrics failed for {user.id}",
-                  event="health_total_outage", user_id=user.id,
+                  event="health_total_outage", user_id=user.id, report=True,
                   errors={k: v.get("status") for k, v in day_data["errors"].items()})
         return failed("all health data types failed transiently", retryable=True)
 

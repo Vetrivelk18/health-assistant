@@ -39,8 +39,18 @@ class TelegramClient:
 
         return self._result(await self._post("sendMessage", payload))
 
-    async def set_webhook(self, url: str) -> dict[str, Any]:
-        return self._result(await self._post("setWebhook", {"url": url}))
+    async def set_webhook(self, url: str, *, secret_token: str | None = None) -> dict[str, Any]:
+        """Register the webhook URL.
+
+        `secret_token` is echoed back by Telegram in the
+        X-Telegram-Bot-Api-Secret-Token header on every delivery, which is
+        what lets the endpoint tell a real update from a forged one. Telegram
+        restricts it to 1-256 chars of A-Z, a-z, 0-9, _ and -.
+        """
+        payload: dict[str, Any] = {"url": url}
+        if secret_token:
+            payload["secret_token"] = secret_token
+        return self._result(await self._post("setWebhook", payload))
 
     async def _post(self, method: str, payload: dict[str, Any]) -> httpx.Response:
         try:
