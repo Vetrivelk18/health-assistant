@@ -242,6 +242,28 @@ python3 probe_health_api.py
   learns the URL. It fails open **only** when `FASTAPI_ENV=development`;
   unset in production is a 403, deliberately. Registering the webhook and
   setting the secret must happen together — `set_webhook(secret_token=...)`.
+- **OAuth `state` is a signed token, not a server-side entry.** It was a
+  module-level dict, which fails in exactly this deployment: Cloud Run
+  scales to zero (cold start empties it) and runs multiple instances (the
+  callback can land somewhere the login never touched). Both surface as
+  "Invalid state parameter" right after a *successful* consent screen. Don't
+  reintroduce server-side state — `utils/oauth_state.py` signs the chat id
+  and expiry with `SECRET_KEY` so any instance can verify one it didn't
+  issue. `SECRET_KEY` is therefore security-critical, and `validate_settings`
+  refuses to start in production if it's still the default.
+- **`openid` and `email` scopes are force-added in `config.py`**, after
+  reading `GOOGLE_HEALTH_SCOPES` from the environment. They're what make the
+  token response carry an `id_token`, which is the only source for the real
+  `google_user_id` and `email` — both UNIQUE columns that previously held
+  values synthesized from the Telegram chat id. Adding them to the default
+  list alone wasn't enough: an existing `.env` overrides it silently.
+- **The 7-day refresh-token expiry is a scheduled event, not an edge case**,
+  because the consent screen stays in Testing. The daily run therefore
+  *notifies* the user (once per `RENAG_AFTER_DAYS`) rather than failing
+  silently, and warns a day ahead based on `refresh_token_issued_at`. That
+  column is set on `exchange_code` only — a refresh returns a new access
+  token but does not restart the refresh token's clock, so setting it there
+  would push the warning permanently into the future.
 - **Error Reporting ingests an entry only if it carries the
   `ReportedErrorEvent` `@type` *and* has the stack trace inside `message`.**
   A trace on any other key is silently ignored. `utils/logging_config.py`

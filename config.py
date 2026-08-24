@@ -15,6 +15,12 @@ class Settings:
     GOOGLE_PROJECT_ID: str = os.getenv("GOOGLE_PROJECT_ID", "health-assistant-505718")
     GOOGLE_AUTH_URI: str = os.getenv("GOOGLE_AUTH_URI", "https://accounts.google.com/o/oauth2/auth")
     GOOGLE_TOKEN_URI: str = os.getenv("GOOGLE_TOKEN_URI", "https://oauth2.googleapis.com/token")
+    # `openid` and `email` are prepended unconditionally below — they're
+    # non-sensitive (no extra verification burden) and are what make the
+    # token response carry an id_token, which is the only way to learn the
+    # user's real Google account id and address. The users table has UNIQUE
+    # constraints on both, so without them we'd be storing values
+    # synthesized from the Telegram chat id.
     GOOGLE_HEALTH_SCOPES: list = os.getenv("GOOGLE_HEALTH_SCOPES", "").split() or [
         "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
         "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
@@ -86,12 +92,34 @@ class Settings:
 
 settings = Settings()
 
+# Guarantee the identity scopes regardless of how GOOGLE_HEALTH_SCOPES was
+# set. Doing this here rather than in the default list above means an
+# existing .env that predates them still gets an id_token — otherwise the
+# env value silently wins and the real google_user_id/email are never read.
+for _identity_scope in ("email", "openid"):
+    if _identity_scope not in settings.GOOGLE_HEALTH_SCOPES:
+        settings.GOOGLE_HEALTH_SCOPES.insert(0, _identity_scope)
+
 # Validate required settings
+DEFAULT_SECRET_KEY = "dev-secret-key-change-in-production"
+
+
 def validate_settings():
     required = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN"]
     missing = [key for key in required if not getattr(settings, key)]
     if missing:
         raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+
+    # SECRET_KEY signs the OAuth state parameter, which is what binds a
+    # callback to the Telegram chat that started it. Shipping the default
+    # would let anyone forge a state naming someone else's chat id and have
+    # that user's Google tokens written against their own account — so this
+    # is a hard failure, not a warning.
+    if settings.SECRET_KEY == DEFAULT_SECRET_KEY:
+        raise ValueError(
+            "SECRET_KEY is still the development default. Generate one with "
+            "`openssl rand -hex 32` — it signs OAuth state parameters."
+        )
 
 if settings.FASTAPI_ENV != "development":
     validate_settings()

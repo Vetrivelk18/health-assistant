@@ -4,8 +4,7 @@ Handles /login (start OAuth flow) and /callback (receive auth code)
 """
 
 import logging
-import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -16,6 +15,7 @@ from database import get_db, SessionLocal
 from models import User, OAuthToken
 from services.google_health import GoogleHealthClient, GoogleHealthError
 from config import settings
+from utils import oauth_state
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +28,9 @@ google_health_client = GoogleHealthClient(
     scopes=settings.GOOGLE_HEALTH_SCOPES,
 )
 
-# Store OAuth state temporarily (in production, use Redis)
-_oauth_states = {}
+# No server-side state store on purpose — the state token is signed and
+# self-contained, so any instance can verify one it didn't issue. See
+# utils/oauth_state.py for why a dict was wrong here.
 
 
 def _naive_utc(dt: datetime) -> datetime:
@@ -49,12 +50,9 @@ async def start_oauth_flow(telegram_chat_id: str, db: Session = Depends(get_db))
     Returns:
         auth_url: URL for user to visit for authorization
     """
-    # Generate random state for CSRF protection
-    state = secrets.token_urlsafe(32)
-    _oauth_states[state] = {
-        "telegram_chat_id": telegram_chat_id,
-        "created_at": datetime.utcnow(),
-    }
+    # Signed, self-contained state for CSRF protection — carries the chat id
+    # and its own expiry, so the callback can be verified by any instance.
+    state = oauth_state.issue(telegram_chat_id, settings.SECRET_KEY)
 
     # Get authorization URL from Google
     auth_url = google_health_client.authorization_url(state)
@@ -85,18 +83,14 @@ async def oauth_callback(
     Returns:
         success message with user info
     """
-    # Verify state parameter
-    if state not in _oauth_states:
-        logger.error(f"🚨 Invalid OAuth state: {state}")
-        raise HTTPException(status_code=400, detail="Invalid state parameter")
-
-    state_data = _oauth_states.pop(state)
-    telegram_chat_id = state_data["telegram_chat_id"]
-
-    # Check state expiration (5 minutes)
-    if datetime.utcnow() - state_data["created_at"] > timedelta(minutes=5):
-        logger.error(f"🚨 OAuth state expired for {telegram_chat_id}")
-        raise HTTPException(status_code=400, detail="Authorization expired")
+    # Verify the signature and expiry, and recover which chat started this.
+    # The signature is what stops a caller supplying someone else's chat id
+    # and having tokens written against their account.
+    try:
+        telegram_chat_id = oauth_state.verify(state, settings.SECRET_KEY)
+    except oauth_state.OAuthStateError as e:
+        logger.error(f"🚨 Rejected OAuth callback state: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid state parameter: {e}")
 
     try:
         # Exchange code for tokens
@@ -108,6 +102,13 @@ async def oauth_callback(
         refresh_token = tokens.refresh_token
         expires_at = _naive_utc(tokens.expires_at)
 
+        # Real identity from the id_token, with the old synthesized values
+        # as a fallback so a missing id_token can't fail the connection.
+        # Both columns are UNIQUE, so placeholders derived from the chat id
+        # were a latent collision waiting for a second account.
+        google_user_id = tokens.google_user_id or f"google_{telegram_chat_id}"
+        email = tokens.email or f"telegram_{telegram_chat_id}@local"
+
         # Get or create user
         user = db.query(User).filter(User.telegram_chat_id == telegram_chat_id).first()
 
@@ -115,28 +116,40 @@ async def oauth_callback(
             # Create new user
             user = User(
                 telegram_chat_id=telegram_chat_id,
-                google_user_id=f"google_{telegram_chat_id}",  # Placeholder
-                email=f"telegram_{telegram_chat_id}@local",  # Placeholder
+                google_user_id=google_user_id,
+                email=email,
                 connected=True,
             )
             db.add(user)
             db.commit()
             logger.info(f"👤 Created new user: {telegram_chat_id}")
         else:
-            # Update existing user
+            # Update existing user, upgrading any placeholder identity
+            # written before the openid/email scopes were requested.
             user.connected = True
+            if tokens.google_user_id:
+                user.google_user_id = tokens.google_user_id
+            if tokens.email:
+                user.email = tokens.email
             db.commit()
             logger.info(f"👤 Updated user: {telegram_chat_id}")
 
         # Store tokens in database
         oauth_token = db.query(OAuthToken).filter(OAuthToken.user_id == user.id).first()
 
+        # This is a full consent flow, so the 7-day Testing-mode clock on
+        # the refresh token restarts now — and any earlier "please
+        # reconnect" nag is resolved.
+        now = datetime.utcnow()
+
         if oauth_token:
             # Update existing token record
             oauth_token.access_token = access_token
             oauth_token.refresh_token = refresh_token
             oauth_token.expires_at = expires_at
-            oauth_token.updated_at = datetime.utcnow()
+            oauth_token.updated_at = now
+            oauth_token.refresh_token_issued_at = now
+            oauth_token.reconnect_notified_at = None
         else:
             # Create new token record
             oauth_token = OAuthToken(
@@ -145,6 +158,7 @@ async def oauth_callback(
                 refresh_token=refresh_token,
                 expires_at=expires_at,
                 scope=tokens.scope or " ".join(google_health_client.scopes),
+                refresh_token_issued_at=now,
             )
             db.add(oauth_token)
 
