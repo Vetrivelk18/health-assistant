@@ -28,6 +28,13 @@ class Settings:
     # Telegram
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_WEBHOOK_URL: str = os.getenv("TELEGRAM_WEBHOOK_URL")
+    # Shared secret echoed back by Telegram in the
+    # X-Telegram-Bot-Api-Secret-Token header on every webhook delivery. The
+    # webhook URL is public and unauthenticated (it has to be — Telegram
+    # can't do OIDC), so without this anyone who learns the URL can POST a
+    # forged update carrying someone else's chat_id. Set it when registering
+    # the webhook via setWebhook(secret_token=...). See DEPLOY.md.
+    TELEGRAM_WEBHOOK_SECRET: str = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
     # Database
     DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/health_assistant")

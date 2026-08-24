@@ -193,3 +193,42 @@ def test_exception_logging_includes_stack_trace():
 
     parsed = json.loads(CloudLoggingFormatter().format(record))
     assert "kaboom" in parsed["stack_trace"]
+
+
+def test_exception_entry_is_tagged_for_error_reporting():
+    """Cloud Error Reporting only ingests entries carrying this @type with
+    the trace inside `message` — a trace on any other key is ignored and the
+    error silently never surfaces."""
+    try:
+        raise ValueError("kaboom")
+    except ValueError:
+        import sys
+        record = logging.LogRecord(
+            "test", logging.ERROR, "f.py", 1, "failed", None, sys.exc_info()
+        )
+
+    parsed = json.loads(CloudLoggingFormatter().format(record))
+    assert parsed["@type"].endswith("ReportedErrorEvent")
+    assert "kaboom" in parsed["message"]  # must be in message, not just alongside
+
+
+def test_report_flag_surfaces_non_exception_errors(caplog):
+    logger = logging.getLogger("test.report")
+    with caplog.at_level(logging.ERROR, logger="test.report"):
+        log_event(logger, logging.ERROR, "everything is down",
+                  event="health_total_outage", report=True)
+
+    parsed = json.loads(CloudLoggingFormatter().format(caplog.records[0]))
+    assert parsed["@type"].endswith("ReportedErrorEvent")
+
+
+def test_ordinary_errors_are_not_reported(caplog):
+    """An expired refresh token is expected operationally — it must not page
+    anyone through Error Reporting."""
+    logger = logging.getLogger("test.report")
+    with caplog.at_level(logging.ERROR, logger="test.report"):
+        log_event(logger, logging.ERROR, "token expired",
+                  event="summary_failed", user_id="u-1", transient=False)
+
+    parsed = json.loads(CloudLoggingFormatter().format(caplog.records[0]))
+    assert "@type" not in parsed
