@@ -14,6 +14,7 @@ from datetime import timezone as dt_timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import routes.internal as internal_module
@@ -285,7 +286,7 @@ def test_run_daily_reports_enqueue_failure_without_sinking_the_batch(connected_u
 
 # ------------------------------------------------- the per-user worker ----
 
-def _post_single(user_id: str, target_day: str = "2026-08-21"):
+def _post_single(user_id, target_day="2026-08-21"):
     return client.post(
         "/internal/run-single-user",
         json={"user_id": user_id, "target_day": target_day},
@@ -553,3 +554,114 @@ def test_target_day_invalid_timezone_falls_back_to_utc():
     with patch("routes.internal.datetime") as mock_dt:
         mock_dt.now.side_effect = lambda tz=None: fixed_now.astimezone(tz) if tz else fixed_now
         assert internal_module._target_day(user) == date(2026, 8, 21)
+
+
+# ------------------------------------------------- reconnect notifications ----
+
+def _expire_auth():
+    """Make _valid_access_token fail the way a dead refresh token does."""
+    return patch(
+        "routes.internal._valid_access_token",
+        side_effect=HTTPException(status_code=401, detail="Token refresh failed: invalid_grant"),
+    )
+
+
+def test_expired_auth_tells_the_user_to_reconnect(connected_user):
+    """Before this, the daily run logged the failure and went silent — the
+    user's summaries just stopped with no explanation."""
+    with patch(
+        "routes.internal.google_id_token.verify_oauth2_token", return_value=VALID_CLAIMS
+    ), _expire_auth(), patch(
+        "routes.internal.telegram_client.send_message", new=AsyncMock()
+    ) as mock_send:
+        response = _post_single(connected_user)
+
+    assert response.status_code == 200          # permanent — must not retry
+    assert response.json()["status"] == "failed"
+    mock_send.assert_awaited_once()
+    assert "/connect" in mock_send.await_args.args[1]
+
+
+def test_reconnect_nag_is_not_repeated_every_morning(connected_user):
+    """A user whose consent lapsed would otherwise be messaged daily, which
+    trains them to ignore the one message they need to act on."""
+    with patch(
+        "routes.internal.google_id_token.verify_oauth2_token", return_value=VALID_CLAIMS
+    ), _expire_auth(), patch(
+        "routes.internal.telegram_client.send_message", new=AsyncMock()
+    ) as mock_send:
+        _post_single(connected_user, target_day="2026-08-21")
+        _post_single(connected_user, target_day="2026-08-22")
+        _post_single(connected_user, target_day="2026-08-23")
+
+    assert mock_send.await_count == 1
+
+
+def test_warning_sent_the_day_before_expiry(connected_user):
+    """Warn while things still work, so the user reconnects before any
+    summary is actually missed."""
+    db = SessionLocal()
+    token = db.query(OAuthToken).filter(OAuthToken.user_id == connected_user).first()
+    token.refresh_token_issued_at = datetime.utcnow() - timedelta(days=6)
+    db.commit()
+    db.close()
+
+    fetch, summarise, _ = _health_and_gemini_patches()
+    with patch(
+        "routes.internal.google_id_token.verify_oauth2_token", return_value=VALID_CLAIMS
+    ), fetch, summarise, patch(
+        "routes.internal.telegram_client.send_message", new=AsyncMock()
+    ) as mock_send:
+        response = _post_single(connected_user)
+
+    assert response.json()["status"] == "sent"
+    # Summary first, then the warning — a warning before the thing it warns
+    # about reads as an error.
+    assert mock_send.await_count == 2
+    assert "expires tomorrow" in mock_send.await_args.args[1]
+
+
+def test_no_warning_when_token_is_fresh(connected_user):
+    db = SessionLocal()
+    token = db.query(OAuthToken).filter(OAuthToken.user_id == connected_user).first()
+    token.refresh_token_issued_at = datetime.utcnow()
+    db.commit()
+    db.close()
+
+    fetch, summarise, _ = _health_and_gemini_patches()
+    with patch(
+        "routes.internal.google_id_token.verify_oauth2_token", return_value=VALID_CLAIMS
+    ), fetch, summarise, patch(
+        "routes.internal.telegram_client.send_message", new=AsyncMock()
+    ) as mock_send:
+        _post_single(connected_user)
+
+    assert mock_send.await_count == 1  # the summary only
+
+
+def test_no_warning_when_issue_date_is_unknown(connected_user):
+    """Tokens predating the column shouldn't produce a warning based on a
+    guess."""
+    fetch, summarise, _ = _health_and_gemini_patches()
+    with patch(
+        "routes.internal.google_id_token.verify_oauth2_token", return_value=VALID_CLAIMS
+    ), fetch, summarise, patch(
+        "routes.internal.telegram_client.send_message", new=AsyncMock()
+    ) as mock_send:
+        _post_single(connected_user)
+
+    assert mock_send.await_count == 1
+
+
+def test_notification_failure_does_not_change_the_outcome(connected_user):
+    """Failing to deliver a nag is not itself a reason to retry the user."""
+    with patch(
+        "routes.internal.google_id_token.verify_oauth2_token", return_value=VALID_CLAIMS
+    ), _expire_auth(), patch(
+        "routes.internal.telegram_client.send_message",
+        new=AsyncMock(side_effect=TelegramError("blocked", 403)),
+    ):
+        response = _post_single(connected_user)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"

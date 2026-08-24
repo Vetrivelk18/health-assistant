@@ -60,7 +60,7 @@ def test_login_returns_auth_url():
 def test_callback_invalid_state_returns_400():
     response = client.get("/auth/callback", params={"code": "x", "state": "not-a-real-state"})
     assert response.status_code == 400
-    assert response.json()["detail"] == "Invalid state parameter"
+    assert response.json()["detail"].startswith("Invalid state parameter")
 
 
 def test_callback_creates_user_and_token():
@@ -121,3 +121,73 @@ def test_full_oauth_lifecycle():
 
     final_status = client.get(f"/auth/status/{user_id}")
     assert final_status.json()["authenticated"] is False
+
+
+# ------------------------------------------------------ real identity ----
+
+def _id_token(sub: str, email: str) -> str:
+    """A JWT-shaped id_token. Only the payload segment is read."""
+    import base64
+    import json
+
+    def seg(d):
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+
+    return f"{seg({'alg': 'RS256'})}.{seg({'sub': sub, 'email': email})}.signature"
+
+
+def test_id_token_claims_are_decoded():
+    from services.google_health import decode_id_token_claims
+
+    claims = decode_id_token_claims(_id_token("109876543210", "real@gmail.com"))
+    assert claims["sub"] == "109876543210"
+    assert claims["email"] == "real@gmail.com"
+
+
+def test_malformed_id_token_does_not_raise():
+    """Identity is useful metadata, not worth failing a good connection."""
+    from services.google_health import decode_id_token_claims
+
+    assert decode_id_token_claims("not-a-jwt") == {}
+    assert decode_id_token_claims("") == {}
+
+
+def test_bundle_extracts_identity_from_token_response():
+    from services.google_health import GoogleHealthClient
+
+    bundle = GoogleHealthClient._bundle({
+        "access_token": "at",
+        "refresh_token": "rt",
+        "expires_in": 3600,
+        "id_token": _id_token("109876543210", "real@gmail.com"),
+    })
+    assert bundle.google_user_id == "109876543210"
+    assert bundle.email == "real@gmail.com"
+
+
+def test_bundle_without_id_token_has_no_identity():
+    """A refresh response carries no id_token — that's expected, not an error."""
+    from services.google_health import GoogleHealthClient
+
+    bundle = GoogleHealthClient._bundle({
+        "access_token": "at", "refresh_token": "rt", "expires_in": 3600,
+    })
+    assert bundle.google_user_id is None
+    assert bundle.email is None
+
+
+def test_openid_and_email_scopes_are_requested():
+    """Without these the token response carries no id_token at all."""
+    from services.google_health import SCOPES
+
+    assert "openid" in SCOPES
+    assert "email" in SCOPES
+
+
+def test_identity_scopes_survive_an_env_override():
+    """A pre-existing .env sets GOOGLE_HEALTH_SCOPES and would otherwise win,
+    silently leaving out openid/email and giving us no id_token."""
+    from config import settings
+
+    assert "openid" in settings.GOOGLE_HEALTH_SCOPES
+    assert "email" in settings.GOOGLE_HEALTH_SCOPES

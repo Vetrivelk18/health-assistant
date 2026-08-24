@@ -430,9 +430,24 @@ Tokens auto-refresh. Check `oauth_tokens` table for expiration.
 ### Refresh token stopped working after ~7 days
 
 While the OAuth consent screen is in **Testing**, Google expires refresh
-tokens after 7 days. Either re-authorize weekly or publish the OAuth consent
-screen to **Production** (real users additionally require OAuth verification —
-a security review plus a published privacy policy and terms of service).
+tokens after 7 days. This is expected, and the bot now handles it: it warns
+you the day before expiry and, if a summary does fail, messages you to
+`/connect` instead of going quiet. Reconnecting takes a few seconds and
+resets the clock.
+
+Publishing to **Production** removes the expiry but requires OAuth
+verification — and the `googlehealth.*` scopes are Restricted, which adds a
+paid annual security assessment. See
+[`DEPLOY.md`](DEPLOY.md#10-going-public-oauth-consent-screen) for the full
+tradeoff and a cheaper alternative.
+
+### "Invalid state parameter" after a successful consent screen
+
+The `state` token expired (10-minute TTL — just retry `/connect`), or
+`SECRET_KEY` changed between starting the login and finishing it. If you're
+running multiple instances, confirm they all share the same `SECRET_KEY`;
+state is verified by signature rather than by shared storage, so a
+mismatched key on one instance breaks only the callbacks that land there.
 
 ## Security Notes
 

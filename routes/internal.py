@@ -134,6 +134,68 @@ def _already_summarised(user: User, target_day: date) -> bool:
     return bool(user.last_summary_sent and user.last_summary_sent.date() >= target_day)
 
 
+# While the OAuth consent screen is in Testing, Google expires refresh
+# tokens 7 days after they're issued. Warn a day early so a reconnect can
+# happen before summaries actually stop.
+REFRESH_TOKEN_LIFETIME_DAYS = 7
+WARN_BEFORE_EXPIRY_DAYS = 1
+RENAG_AFTER_DAYS = 3
+
+RECONNECT_EXPIRED_MESSAGE = (
+    "⚠️ Your Google Health connection has expired, so I couldn't put together "
+    "your summary this morning.\n\n"
+    "Tap /connect to reconnect — it takes a few seconds and you'll be back to "
+    "daily summaries tomorrow."
+)
+
+RECONNECT_SOON_MESSAGE = (
+    "🔔 Heads up — your Google Health connection expires tomorrow.\n\n"
+    "Tap /connect now to reconnect and your summaries won't miss a day.\n"
+    "(Google expires these weekly while the app is unverified.)"
+)
+
+
+async def _notify_once(oauth_token: OAuthToken, user: User, message: str, db: Session,
+                       *, event: str) -> None:
+    """Send a connection notice, at most once every RENAG_AFTER_DAYS.
+
+    Without the throttle a user whose consent lapsed would be messaged every
+    single morning — which reads as spam and trains them to ignore exactly
+    the message they need to act on.
+    """
+    last = oauth_token.reconnect_notified_at
+    if last and (datetime.utcnow() - last) < timedelta(days=RENAG_AFTER_DAYS):
+        return
+
+    try:
+        await telegram_client.send_message(user.telegram_chat_id, message)
+    except TelegramError as e:
+        # Best-effort: failing to deliver a nag must not change the outcome
+        # of the run that triggered it.
+        log_event(logger, logging.WARNING, f"Could not notify {user.id} to reconnect",
+                  event="reconnect_notify_failed", user_id=user.id, error_code=e.error_code)
+        return
+
+    oauth_token.reconnect_notified_at = datetime.utcnow()
+    db.commit()
+    log_event(logger, logging.INFO, f"Told {user.id} to reconnect",
+              event=event, user_id=user.id)
+
+
+def _refresh_token_expires_on(oauth_token: OAuthToken) -> date | None:
+    """Best estimate of when this refresh token stops working.
+
+    Google exposes no expiry for refresh tokens, so this is derived from
+    when the last full consent happened. Returns None for tokens issued
+    before that column existed — better to stay quiet than to warn on a
+    guess.
+    """
+    issued = oauth_token.refresh_token_issued_at
+    if not issued:
+        return None
+    return (issued + timedelta(days=REFRESH_TOKEN_LIFETIME_DAYS)).date()
+
+
 # ----------------------------------------------------------- dispatcher ----
 
 @router.post("/run-daily")
@@ -265,6 +327,16 @@ async def _summarise_user(user: User, target_day: date, db: Session) -> dict:
     except HTTPException as e:
         # A refresh failure is the user's consent being gone (Testing-mode
         # refresh tokens expire after 7 days) — retrying won't recover it.
+        #
+        # Tell them. Before this, the daily run logged the failure and moved
+        # on, so the user's summaries just stopped with no explanation and
+        # no indication that /connect would fix it. Since the consent screen
+        # is staying in Testing, this isn't an edge case — it's what happens
+        # every seven days.
+        log_event(logger, logging.WARNING, f"Auth expired for {user.id}",
+                  event="auth_expired", user_id=user.id, reason=str(e.detail))
+        await _notify_once(oauth_token, user, RECONNECT_EXPIRED_MESSAGE, db,
+                           event="reconnect_prompted")
         return failed(str(e.detail), retryable=False)
 
     # fetch_day never raises for a single failed metric — it records each one
@@ -344,4 +416,14 @@ async def _summarise_user(user: User, target_day: date, db: Session) -> dict:
     log_event(logger, logging.INFO, f"Daily summary sent to {user.id}",
               event="summary_sent", user_id=user.id, day=target_day.isoformat(),
               partial=bool(day_data["errors"]))
+
+    # Sent after the summary, not before: a warning that arrives ahead of
+    # the thing it's warning about reads as an error. Sending it on a day
+    # that otherwise worked is the point — the user reconnects before
+    # anything breaks rather than after.
+    expires_on = _refresh_token_expires_on(oauth_token)
+    if expires_on and (expires_on - date.today()).days <= WARN_BEFORE_EXPIRY_DAYS:
+        await _notify_once(oauth_token, user, RECONNECT_SOON_MESSAGE, db,
+                           event="reconnect_warned")
+
     return {"bucket": "sent", "detail": user.id, "retryable": False}

@@ -51,9 +51,23 @@ class OAuthToken(Base):
     access_token = Column(Text, nullable=False)
     refresh_token = Column(Text, nullable=True)
 
-    # Expiration
+    # Expiration of the *access* token (about an hour).
     expires_at = Column(DateTime, nullable=False)
     scope = Column(String)
+
+    # When the current refresh token was issued by a full consent flow.
+    # Google doesn't tell us when a refresh token expires, and while the
+    # OAuth consent screen is in Testing it silently stops working after 7
+    # days — so this is the only basis for warning a user *before* their
+    # summaries stop arriving. Set on exchange_code, not on refresh: a
+    # refresh returns a new access token but does not restart the 7-day
+    # clock on the refresh token.
+    refresh_token_issued_at = Column(DateTime, nullable=True)
+
+    # When we last told this user their connection needs reconnecting, so
+    # the daily run nags once rather than every morning. Cleared on
+    # reconnect (the whole row is replaced).
+    reconnect_notified_at = Column(DateTime, nullable=True)
 
     # Metadata
     created_at = Column(DateTime, default=datetime.utcnow)
