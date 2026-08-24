@@ -34,9 +34,18 @@ from routes import auth, internal, mcp_tools, telegram
 async def lifespan(app: FastAPI):
     # Startup
     logger.info("🚀 Starting Health Assistant API")
-    from database import init_db
-    init_db()
-    logger.info("✅ Database initialized")
+
+    # Schema management is Alembic's job, not the app's. Creating tables on
+    # boot is a development convenience: in production it would race between
+    # concurrent Cloud Run instances during a cold start, and it silently
+    # can't apply column changes anyway (see database.init_db). Migrations
+    # run as a deliberate step before deploying — see DEPLOY.md.
+    if os.getenv("FASTAPI_ENV", "development") == "development":
+        from database import init_db
+        init_db()
+    else:
+        logger.info("Skipping create_all — schema is managed by Alembic")
+
     yield
     # Shutdown
     logger.info("🛑 Shutting down Health Assistant API")

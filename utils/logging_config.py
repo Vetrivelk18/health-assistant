@@ -54,10 +54,19 @@ class CloudLoggingFormatter(logging.Formatter):
         }
 
         if record.exc_info:
-            # Cloud Error Reporting picks up a stack trace on this key and
-            # groups recurring exceptions together.
-            entry["exception"] = self.formatException(record.exc_info)
-            entry["stack_trace"] = self.formatException(record.exc_info)
+            # Cloud Error Reporting ingests a log entry as an error only when
+            # it's tagged with this @type AND the stack trace is in the
+            # `message` field itself — a trace parked on some other key is
+            # ignored, and the error never appears in the console or fires a
+            # notification. So append the traceback to the message rather
+            # than filing it alongside.
+            trace = self.formatException(record.exc_info)
+            entry["message"] = f"{entry['message']}\n{trace}"
+            entry["stack_trace"] = trace  # kept for direct log queries
+            entry["@type"] = (
+                "type.googleapis.com/google.devtools.clouderrorreporting"
+                ".v1beta1.ReportedErrorEvent"
+            )
 
         # Anything passed as logger.info(..., extra={"fields": {...}}) or as
         # loose extra=... kwargs lands in jsonPayload as its own field.
@@ -103,6 +112,7 @@ def log_event(
     message: str,
     *,
     exc_info: bool = False,
+    report: bool = False,
     **fields: Any,
 ) -> None:
     """Log with structured fields attached.
@@ -110,5 +120,18 @@ def log_event(
     `log_event(logger, logging.ERROR, "summary failed", user_id=u, reason=r)`
     emits a queryable `jsonPayload.user_id` rather than burying the id in a
     message string that can only be grepped.
+
+    `report=True` additionally surfaces the entry in Cloud Error Reporting
+    even though no exception was raised. Use it sparingly — for failures
+    that mean *the system* is broken, not ones that are part of normal
+    operation. A user's 7-day refresh token expiring is expected and should
+    never page anyone; the Health API being down for everyone should.
+    Anything logged with `exc_info=True` is reported automatically.
     """
+    if report:
+        reported_error = (
+            "type.googleapis.com/google.devtools.clouderrorreporting"
+            ".v1beta1.ReportedErrorEvent"
+        )
+        fields = dict(fields, **{"@type": reported_error})
     logger.log(level, message, exc_info=exc_info, extra={"fields": fields})

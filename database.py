@@ -35,8 +35,32 @@ def get_db() -> Session:
         db.close()
 
 def init_db():
-    """Initialize database - create all tables"""
-    logger.info("Initializing database...")
+    """Create any missing tables — development convenience only.
+
+    **This is not a migration tool and must not be treated as one.**
+    `create_all()` creates tables that don't exist and then silently ignores
+    every table that does. Add a column to models.py and this reports
+    success while changing nothing; the app then fails at runtime on a
+    column the database doesn't have. The instinctive fix — drop and
+    recreate — destroys the OAuth tokens, which cannot be regenerated
+    without every user re-authorising.
+
+    Schema changes go through Alembic instead:
+
+        alembic revision --autogenerate -m "add users.device_pref"
+        alembic upgrade head
+
+    Kept for local development and tests, where a throwaway database is
+    genuinely faster to create this way. Refuses to run in production, so
+    it can't quietly diverge from the migration history.
+    """
+    if settings.FASTAPI_ENV != "development":
+        raise RuntimeError(
+            "init_db() is development-only — it cannot alter existing tables. "
+            "Use `alembic upgrade head` to apply schema changes."
+        )
+
+    logger.info("Initializing database (development create_all)...")
     Base.metadata.create_all(bind=engine)
     logger.info("✅ Database initialized")
 

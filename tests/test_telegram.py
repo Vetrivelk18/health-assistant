@@ -137,3 +137,85 @@ def test_disconnect_command(connected_user):
     user = db.query(User).filter(User.telegram_chat_id == TEST_CHAT_ID).first()
     assert user.connected is False
     db.close()
+
+
+# ------------------------------------------------- webhook authentication ----
+
+import routes.telegram as telegram_module  # noqa: E402
+
+WEBHOOK_SECRET = "pytest-webhook-secret"
+
+
+def _post_update(update: dict, secret=None):
+    headers = {"X-Telegram-Bot-Api-Secret-Token": secret} if secret else {}
+    return client.post("/webhook/telegram", json=update, headers=headers)
+
+
+def test_forged_update_without_secret_is_rejected():
+    """The webhook URL is public — the shared secret is the only thing
+    separating a real update from a spoofed one."""
+    with patch.object(telegram_module.settings, "TELEGRAM_WEBHOOK_SECRET", WEBHOOK_SECRET):
+        response = _post_update(_update("/status"))
+    assert response.status_code == 403
+
+
+def test_update_with_wrong_secret_is_rejected():
+    with patch.object(telegram_module.settings, "TELEGRAM_WEBHOOK_SECRET", WEBHOOK_SECRET):
+        response = _post_update(_update("/status"), secret="not-the-secret")
+    assert response.status_code == 403
+
+
+def test_update_with_correct_secret_is_accepted():
+    with patch.object(
+        telegram_module.settings, "TELEGRAM_WEBHOOK_SECRET", WEBHOOK_SECRET
+    ), patch.object(
+        telegram_module.telegram_client, "send_message", new=AsyncMock()
+    ):
+        response = _post_update(_update("/status"), secret=WEBHOOK_SECRET)
+    assert response.status_code == 200
+
+
+def test_unset_secret_fails_closed_in_production():
+    """Forgetting to configure the secret must not silently leave the
+    endpoint open — in production that's a 403, not a fallback."""
+    with patch.object(
+        telegram_module.settings, "TELEGRAM_WEBHOOK_SECRET", None
+    ), patch.object(
+        telegram_module.settings, "FASTAPI_ENV", "production"
+    ):
+        response = _post_update(_update("/status"))
+    assert response.status_code == 403
+
+
+def test_unset_secret_allows_local_development():
+    with patch.object(
+        telegram_module.settings, "TELEGRAM_WEBHOOK_SECRET", None
+    ), patch.object(
+        telegram_module.settings, "FASTAPI_ENV", "development"
+    ), patch.object(
+        telegram_module.telegram_client, "send_message", new=AsyncMock()
+    ):
+        response = _post_update(_update("/status"))
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_set_webhook_registers_the_secret():
+    """Validating the header is useless if setWebhook never registered the
+    secret with Telegram in the first place."""
+    from services.telegram_bot import TelegramClient
+
+    captured = {}
+
+    async def fake_post(method, payload):
+        captured["method"] = method
+        captured["payload"] = payload
+        import httpx
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    tg = TelegramClient("token")
+    with patch.object(tg, "_post", new=fake_post):
+        await tg.set_webhook("https://example.com/webhook/telegram", secret_token="s3cr3t")
+
+    assert captured["method"] == "setWebhook"
+    assert captured["payload"]["secret_token"] == "s3cr3t"

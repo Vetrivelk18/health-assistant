@@ -70,6 +70,9 @@ Cloud Scheduler → POST /internal/run-daily (OIDC-authenticated)
 ├── config.py                 # Configuration & environment
 ├── models.py                 # SQLAlchemy ORM models
 ├── database.py               # Database connection
+├── alembic.ini               # Migration config (url injected from env)
+├── alembic/                  # Schema migrations — see DEPLOY.md §1
+│   └── versions/
 ├── requirements.txt          # Python dependencies
 ├── Dockerfile                # Cloud Run container build
 ├── .env.example              # Environment template
@@ -197,8 +200,20 @@ that's synced recently.
 
 1. Message [@BotFather](https://t.me/botfather) on Telegram
 2. Create new bot (get token)
-3. Set webhook URL: `https://yourdomain.com/webhook/telegram`
-4. Copy token to `.env`
+3. Generate a webhook secret: `openssl rand -hex 32` → `TELEGRAM_WEBHOOK_SECRET`
+4. Register the webhook **with that secret**:
+
+   ```bash
+   curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" \
+     -d "url=https://yourdomain.com/webhook/telegram" \
+     -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+   ```
+
+   Telegram echoes it back in the `X-Telegram-Bot-Api-Secret-Token` header
+   on every delivery, and the endpoint rejects anything without it. The
+   webhook URL is public, so this is what stops a stranger POSTing a forged
+   update carrying your `chat_id`. Required in production; optional locally.
+5. Copy token to `.env`
 
 ### 7. Run Locally
 
@@ -368,11 +383,28 @@ flake8 .
 
 ### Database Migrations
 
+Alembic is set up, with the current schema captured as a baseline revision.
+**Never change the schema with `create_all()`** — it silently ignores tables
+that already exist, so a new column appears to succeed while doing nothing.
+`init_db()` is development-only and raises elsewhere.
+
 ```bash
-alembic init alembic
-alembic revision --autogenerate -m "Add users table"
-alembic upgrade head
+# After editing models.py
+alembic revision --autogenerate -m "add users.device_pref"
+
+# Read the generated file — autogenerate renders renames as drop+create
+# (data loss) and misses server defaults and check constraints
+alembic upgrade head --sql   # preview the exact SQL
+alembic upgrade head         # apply
+
+# For a database that already has the tables (pre-Alembic), baseline once:
+alembic stamp head
 ```
+
+The connection URL comes from `DATABASE_URL` via `alembic/env.py`, not from
+`alembic.ini` — that file is committed and the URL is a secret. Full
+workflow, including rehearsing against a Neon branch, is in
+[`DEPLOY.md`](DEPLOY.md#schema-changes-after-the-first-deploy).
 
 ## Troubleshooting
 

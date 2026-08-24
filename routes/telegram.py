@@ -9,8 +9,9 @@ Query Pipeline" entry point described in README.md.
 """
 
 import logging
+import secrets
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from config import settings
@@ -30,12 +31,49 @@ telegram_client = TelegramClient(settings.TELEGRAM_BOT_TOKEN)
 NOT_CONNECTED_MESSAGE = "You're not connected yet — send /connect to link your Fitbit/Pixel Watch account."
 
 
+def verify_telegram_secret(
+    x_telegram_bot_api_secret_token: str = Header(default=None),
+) -> None:
+    """Reject updates that didn't come from Telegram.
+
+    This endpoint must stay publicly reachable — Telegram can't authenticate
+    with OIDC the way Cloud Scheduler does — so the only thing separating a
+    real update from a forged one is this shared secret, which Telegram
+    echoes back on every delivery after setWebhook(secret_token=...).
+
+    Without it, anyone who learns the URL can POST an update carrying
+    another user's chat_id: burn their Gemini quota, read summaries back, or
+    spoof /disconnect.
+
+    Compared with compare_digest to avoid leaking the secret a byte at a
+    time through response-timing differences.
+    """
+    expected = settings.TELEGRAM_WEBHOOK_SECRET
+    if not expected:
+        # Fail open only outside production, so local dev and tests work
+        # without a secret — but never silently in production.
+        if settings.FASTAPI_ENV != "development":
+            logger.error("🚨 TELEGRAM_WEBHOOK_SECRET is unset in production — refusing webhook")
+            raise HTTPException(status_code=403, detail="Webhook not configured")
+        return
+
+    provided = x_telegram_bot_api_secret_token or ""
+    if not secrets.compare_digest(provided, expected):
+        logger.warning("🚨 Rejected Telegram webhook with bad or missing secret token")
+        raise HTTPException(status_code=403, detail="Invalid secret token")
+
+
 @router.post("/telegram")
-async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
+async def telegram_webhook(
+    request: Request,
+    _: None = Depends(verify_telegram_secret),
+    db: Session = Depends(get_db),
+):
     """
     Telegram calls this for every update. Always return 200 — a non-2xx
     response makes Telegram retry, and repeated failures get the webhook
-    disabled.
+    disabled. (The 403 from the secret-token check above is deliberate and
+    happens before this: a forged request should be rejected, not absorbed.)
     """
     update = await request.json()
     message = update.get("message") or update.get("edited_message")
