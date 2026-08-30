@@ -5,13 +5,10 @@ Handles /login (start OAuth flow) and /callback (receive auth code)
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import IntegrityError
-import httpx
 
-from database import get_db, SessionLocal
+from database import get_db
 from models import User, OAuthToken
 from services.google_health import GoogleHealthClient, GoogleHealthError
 from config import settings
