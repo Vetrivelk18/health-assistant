@@ -219,3 +219,106 @@ async def test_set_webhook_registers_the_secret():
 
     assert captured["method"] == "setWebhook"
     assert captured["payload"]["secret_token"] == "s3cr3t"
+
+
+# ----------------------------------------------------- /timezone command ----
+
+def _connected_user_row(tz="UTC"):
+    db = SessionLocal()
+    user = User(
+        telegram_chat_id=TEST_CHAT_ID,
+        google_user_id=f"google_{TEST_CHAT_ID}",
+        email=f"telegram_{TEST_CHAT_ID}@local",
+        connected=True,
+        timezone=tz,
+    )
+    db.add(user)
+    db.commit()
+    uid = user.id
+    db.close()
+    return uid
+
+
+def _send(text):
+    """Run one message through the handler and capture the bot's reply."""
+    sent = {}
+
+    async def capture(chat_id, message, **kw):
+        sent["text"] = message
+
+    with patch.object(
+        telegram_module.settings, "TELEGRAM_WEBHOOK_SECRET", None
+    ), patch.object(
+        telegram_module.settings, "FASTAPI_ENV", "development"
+    ), patch.object(
+        telegram_module.telegram_client, "send_message", new=capture
+    ):
+        client.post("/webhook/telegram", json=_update(text))
+    return sent.get("text", "")
+
+
+def test_timezone_command_sets_a_city_name():
+    uid = _connected_user_row()
+    reply = _send("/timezone Kolkata")
+
+    assert "Asia/Kolkata" in reply
+    db = SessionLocal()
+    assert db.query(User).filter(User.id == uid).first().timezone == "Asia/Kolkata"
+    db.close()
+
+
+def test_timezone_command_shows_current_when_given_no_argument():
+    _connected_user_row(tz="Europe/London")
+    reply = _send("/timezone")
+    assert "Europe/London" in reply
+
+
+def test_timezone_command_suggests_rather_than_guessing():
+    """IST means three different countries — picking one silently would put
+    the user's whole day boundary in the wrong place."""
+    uid = _connected_user_row()
+    reply = _send("/timezone IST")
+
+    assert "Asia/Kolkata" not in reply or "Did you mean" in reply
+    db = SessionLocal()
+    assert db.query(User).filter(User.id == uid).first().timezone == "UTC"  # unchanged
+    db.close()
+
+
+def test_timezone_command_rejects_nonsense_helpfully():
+    _connected_user_row()
+    reply = _send("/timezone Mars")
+    assert "don't recognise" in reply or "Did you mean" in reply
+
+
+def test_status_warns_while_timezone_is_still_the_default():
+    """UTC is a default nobody chose — surface it rather than letting
+    summaries quietly arrive at odd hours."""
+    _connected_user_row(tz="UTC")
+    db = SessionLocal()
+    user = db.query(User).filter(User.telegram_chat_id == TEST_CHAT_ID).first()
+    db.add(OAuthToken(
+        user_id=user.id, access_token="a", refresh_token="r",
+        expires_at=datetime.utcnow() + timedelta(hours=1), scope="",
+    ))
+    db.commit()
+    db.close()
+
+    reply = _send("/status")
+    assert "/timezone" in reply
+
+
+def test_status_does_not_warn_once_timezone_is_set():
+    _connected_user_row(tz="Asia/Kolkata")
+    db = SessionLocal()
+    user = db.query(User).filter(User.telegram_chat_id == TEST_CHAT_ID).first()
+    db.add(OAuthToken(
+        user_id=user.id, access_token="a", refresh_token="r",
+        expires_at=datetime.utcnow() + timedelta(hours=1), scope="",
+    ))
+    db.commit()
+    db.close()
+
+    reply = _send("/status")
+    assert "Asia/Kolkata" in reply
+    assert "still the UTC default" not in reply
