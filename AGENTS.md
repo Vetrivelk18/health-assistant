@@ -114,9 +114,11 @@ pip install -r requirements.txt
 # Run the app
 python app.py                  # or: uvicorn app:app --reload
 
-# Tests
+# Tests — these run against a throwaway `<your db>_test` database that
+# tests/conftest.py creates automatically. They never touch your dev data.
 pytest
 pytest --cov=.
+TEST_DATABASE_URL=postgresql://... pytest   # point somewhere else
 
 # Lint / format
 black .
@@ -220,6 +222,31 @@ python3 probe_health_api.py
   both default to retrying forever, which for a daily job means a
   permanently broken user burns quota and Gemini tokens indefinitely. The
   endpoint's 200-vs-503 classification is what makes a small budget safe.
+- **Tests run against a separate `*_test` database**, derived from
+  `DATABASE_URL` and created on demand by `tests/conftest.py`, which also
+  wipes every table between tests. Don't reintroduce per-file cleanup
+  fixtures as the primary guard — the reason isolation was added is that a
+  test erroring *before* its own cleanup ran left `pytest_*` rows behind and
+  broke the next run with a UNIQUE violation. Postgres, not SQLite, on
+  purpose: the app depends on Postgres behaviour and a suite passing on
+  SQLite would be testing the wrong engine.
+- **Code must work on 3.11 *and* 3.9.** 3.11 is production (see the
+  Dockerfile); 3.9 matters because the checked-in dev venv is macOS system
+  Python, where `X | None` in a runtime-evaluated annotation raises
+  `TypeError` — that has broken the suite locally twice. Either add
+  `from __future__ import annotations` or use `Optional[...]`. This
+  constraint goes away once the dev venv is rebuilt on 3.11.
+- **Check model/migration drift before pushing**: `alembic upgrade head &&
+  alembic check`, and confirm the migration reverses with `alembic downgrade
+  base && alembic upgrade head`. Drift is what made the suite fail with
+  "column does not exist" — a failure that looked like a code bug and
+  wasn't. A downgrade that doesn't work is otherwise only discovered when
+  it's needed, which is the worst possible moment.
+- **There is no CI workflow in the repo yet.** One is written and verified
+  (two jobs: tests on 3.11/3.9 against a Postgres service, plus the
+  migration checks above) but pushing anything under `.github/workflows/`
+  requires a credential with the `workflow` scope, which the current one
+  lacks. Until it's added by hand, the checks above are manual.
 - **Never change the schema with `create_all()`.** It creates missing tables
   and silently ignores existing ones — add a column to `models.py` and it
   reports success while doing nothing, then the app fails at runtime on the

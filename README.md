@@ -374,6 +374,30 @@ pytest
 pytest --cov=.  # With coverage
 ```
 
+Tests run against a throwaway `<your database>_test` database that
+`tests/conftest.py` derives from `DATABASE_URL`, creates if missing, and
+wipes between tests — **your development data is never touched**. Point it
+elsewhere with `TEST_DATABASE_URL` if you'd rather.
+
+It stays on Postgres rather than SQLite deliberately: the app depends on
+Postgres behaviour (JSON columns, the summary upsert), so a suite green on
+SQLite while production runs Postgres would be testing the wrong engine.
+
+Before pushing, it's worth running what CI is intended to run:
+
+```bash
+pytest                                    # on 3.11 (production) and 3.9 (dev venv)
+alembic upgrade head && alembic check     # models vs migrations must not drift
+alembic downgrade base && alembic upgrade head   # every migration must reverse
+```
+
+> **CI workflow not yet added.** The `.github/workflows/ci.yml` for this is
+> written and verified but couldn't be committed — pushing anything under
+> `.github/workflows/` needs a credential with the `workflow` scope. Add it
+> via GitHub's web editor (Actions → New workflow), or grant the scope with
+> `gh auth refresh -h github.com -s workflow && gh auth setup-git` and
+> commit it normally.
+
 ### Code Style
 
 ```bash
