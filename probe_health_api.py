@@ -17,6 +17,11 @@ fine and the account simply has no device data behind it.
 
     pip install httpx python-dotenv
     python3 probe_health_api.py
+    python3 probe_health_api.py --reauth   # switch to a different account
+
+The run prints which Google account it authorised as. That matters more than
+it sounds: "no data" only means something once you know which account was
+actually asked, and a cached token silently reuses whoever consented last.
 
 Requires in .env (or the environment):
     GOOGLE_CLIENT_ID
@@ -209,11 +214,21 @@ async def main() -> None:
     FIXTURES.mkdir(exist_ok=True)
 
     # ---- token ----
+    # --reauth forces a fresh consent screen. Without it the cached refresh
+    # token is reused, which is the right default when re-probing the same
+    # account — and a trap when probing a *different* one: the run would
+    # silently authorise as whoever consented last, and an empty result
+    # would look like the new account has no data when it was never asked.
+    reauth = "--reauth" in sys.argv
+
     tokens = None
-    if TOKEN_CACHE.exists():
+    cached_email = None
+    if TOKEN_CACHE.exists() and not reauth:
         cached = json.loads(TOKEN_CACHE.read_text())
+        cached_email = cached.get("email")
         if cached.get("refresh_token"):
-            say("Reusing the cached refresh token …", "d")
+            say(f"Reusing the cached token for {cached_email or 'the previous account'} "
+                f"(--reauth to switch accounts) …", "d")
             try:
                 tokens = await client.refresh(cached["refresh_token"])
             except GoogleHealthError as e:
@@ -221,6 +236,8 @@ async def main() -> None:
                 if "invalid_grant" in e.body:
                     say("  invalid_grant usually means the consent screen is in", "y")
                     say("  'Testing', where refresh tokens die after 7 days.", "y")
+    elif reauth:
+        say("--reauth: ignoring any cached token, forcing a fresh consent.", "y")
 
     if tokens is None:
         # Synchronous on purpose — the event loop must not be re-entered.
@@ -229,14 +246,24 @@ async def main() -> None:
         )
         tokens = await client.exchange_code(code)
 
+    # A refresh returns no id_token, so fall back to whatever the last full
+    # consent recorded.
+    account_email = tokens.email or cached_email
+
     TOKEN_CACHE.write_text(json.dumps({
         "access_token": tokens.access_token,
         "refresh_token": tokens.refresh_token,
         "expires_at": tokens.expires_at.isoformat(),
         "scope": tokens.scope,
+        "email": account_email,
     }, indent=2))
 
     say("\n✓ Access token acquired.", "g")
+    # Naming the account matters: "no data" is only meaningful once you know
+    # which account was actually asked. Probing the wrong one looks
+    # identical to probing an empty one.
+    say(f"  account       : {account_email or '(unknown — id_token had no email claim)'}",
+        "g" if account_email else "y")
     say(f"  refresh_token : {'yes' if tokens.refresh_token else 'NO — add access_type=offline'}",
         "g" if tokens.refresh_token else "r")
     say(f"  granted scope : {tokens.scope or '(not reported)'}", "d")
