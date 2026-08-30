@@ -6,9 +6,14 @@ Does the Google Health API return real sleep / steps / heart-rate data for
 your account, and what shape is it?
 
 Standalone: no FastAPI, no database, no Telegram. It runs the OAuth flow in
-your browser, catches the callback locally, then hits every data type —
-trying each candidate filter grammar — and writes whatever comes back
-to ./fixtures/.
+your browser, catches the callback locally, then hits every data type over
+widening time windows (yesterday -> 7 -> 30 -> 90 days) and writes whatever
+comes back to ./fixtures/.
+
+If nothing comes back it distinguishes the causes rather than listing them:
+every-type HTTP failure means an access problem (scopes, API not enabled),
+while HTTP 200 with zero points everywhere means auth and filter grammar are
+fine and the account simply has no device data behind it.
 
     pip install httpx python-dotenv
     python3 probe_health_api.py
@@ -51,7 +56,7 @@ except ImportError:
 
 sys.path.insert(0, str(Path(__file__).parent))
 from services.google_health import (  # noqa: E402
-    DATA_TYPES, FILTER_TEMPLATE_BY_TYPE, GoogleHealthClient, GoogleHealthError,
+    DATA_TYPES, GoogleHealthClient, GoogleHealthError,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -236,30 +241,61 @@ async def main() -> None:
         "g" if tokens.refresh_token else "r")
     say(f"  granted scope : {tokens.scope or '(not reported)'}", "d")
 
+    # ---- scope check ----
+    # A partial consent is invisible otherwise: the token works, every call
+    # returns 200, and the types whose scope was declined just come back
+    # empty — indistinguishable from "the watch wasn't worn".
+    granted = set((tokens.scope or "").split())
+    requested = set(client.scopes)
+    if granted:
+        missing = sorted(s for s in requested if s not in granted and s not in ("openid", "email"))
+        if missing:
+            say("\n⚠ Some requested scopes were NOT granted:", "r")
+            for s in missing:
+                say(f"    {s}", "r")
+            say("  Data types needing these will return empty, not an error.", "r")
+        else:
+            say("  all requested scopes granted", "g")
+
     # ---- probe every data type ----
     # Filter grammar is confirmed and per-type (FILTER_TEMPLATE_BY_TYPE in
     # services/google_health.py) — list_data_points applies it automatically,
     # so this just verifies each type actually returns data for the account.
-    yesterday = date.today() - timedelta(days=1)
-    say(f"\nProbing data types for {yesterday} …\n", "b")
+    #
+    # Widening windows rather than a single day: a watch that last synced a
+    # week ago returns nothing for "yesterday", which reads identically to
+    # having no data at all. Stop at the first window that returns points, so
+    # a healthy account still costs one call per type.
+    windows = [("yesterday", 1), ("last 7 days", 7), ("last 30 days", 30), ("last 90 days", 90)]
+    say(f"\nProbing {len(DATA_TYPES)} data types, widening the window until data appears …\n", "b")
 
     rows: list[tuple[str, str, str]] = []
 
     for friendly, path in DATA_TYPES.items():
-        result, note = None, ""
-        try:
-            result = await client.list_data_points(tokens.access_token, path, yesterday, yesterday)
-            note = "filtered" if path in FILTER_TEMPLATE_BY_TYPE else "unfiltered (no template for this type)"
-        except GoogleHealthError as e:
-            note = str(e.status)
-            if e.status in (401, 403):
-                (FIXTURES / f"{friendly}.error.txt").write_text(e.body)
+        result, note, points = None, "", []
+        last_error = None
 
-        if result is None:
+        for label, days in windows:
+            end = date.today() - timedelta(days=1)
+            start = end - timedelta(days=days - 1)
+            try:
+                result = await client.list_data_points(tokens.access_token, path, start, end)
+            except GoogleHealthError as e:
+                last_error = e
+                note = f"HTTP {e.status}"
+                (FIXTURES / f"{friendly}.error.txt").write_text(e.body)
+                break  # a hard failure won't fix itself with a wider window
+
+            points = result.get("dataPoints", []) or []
+            if points:
+                note = label
+                break
+            note = f"empty through {label}"
+
+        if result is None and last_error is not None:
             rows.append((friendly, C["r"] + "FAIL" + C["x"], note))
             continue
 
-        points = result.get("dataPoints", []) or []
         (FIXTURES / f"{friendly}.json").write_text(json.dumps(result, indent=2))
         mark = (C["g"] + f"{len(points)} points" + C["x"]) if points \
             else (C["y"] + "empty" + C["x"])
@@ -274,15 +310,48 @@ async def main() -> None:
     say("=" * 58, "b")
 
     got = [r for r in rows if "points" in r[1]]
+    failed = [r for r in rows if "FAIL" in r[1]]
+    empty = [r for r in rows if "empty" in r[1]]
+
     say(f"\nFixtures written to {FIXTURES}/", "d")
+
     if got:
         say(f"\n✓ {len(got)}/{len(rows)} data types returned real data.", "g")
-        say("  The project is viable. Build the summary generator against these files.", "g")
-    else:
-        say("\n✗ Nothing returned data.", "r")
-        say("  Check: is health.googleapis.com enabled in the Cloud project?", "r")
-        say("  Is this Google account linked to a Fitbit or Pixel Watch that synced recently?", "r")
-        say("  Any *.error.txt in fixtures/ holds the raw response — paste it to me.", "r")
+        say("  The fixtures now hold real response shapes — these are what", "g")
+        say("  extract_metrics() and the calories work should be built against.", "g")
+        if empty:
+            say(f"\n  Still empty: {', '.join(r[0] for r in empty)}", "y")
+            say("  Likely genuinely not recorded by the device rather than a bug.", "y")
+        return
+
+    # Nothing came back. Separate the possible causes instead of listing them.
+    say("\n✗ No data type returned any data points, over 90 days.", "r")
+
+    if failed and len(failed) == len(rows):
+        statuses = {r[2] for r in failed}
+        say(f"\n  Every type failed outright ({', '.join(sorted(statuses))}).", "r")
+        say("  That's an access problem, not a missing-data problem:", "r")
+        say("    403 → health.googleapis.com not enabled, or scope not granted", "r")
+        say("    401 → token rejected; delete .probe_tokens.json and re-run", "r")
+        say("    400 → filter grammar rejected for that type (a code bug)", "r")
+        say(f"  Raw responses are in {FIXTURES}/*.error.txt — paste one to me.", "r")
+        return
+
+    # The important case: calls succeed, but there is nothing behind them.
+    say("\n  Calls SUCCEEDED (HTTP 200) but returned zero points everywhere.", "y")
+    say("  So auth, scopes and filter grammar are all fine — the API simply", "y")
+    say("  has no data for this account. That points at the data source:", "y")
+    say("")
+    say("    1. Is a Fitbit or Pixel Watch linked to THIS Google account?", "y")
+    say("       (the account you just consented as, not another one)", "y")
+    say("    2. Has that device synced recently? Open the Fitbit app and", "y")
+    say("       force a sync, then re-run this.", "y")
+    say("    3. In the Fitbit/Google Health app, is sharing to Google Health", "y")
+    say("       enabled for sleep, activity and heart rate?", "y")
+    say("")
+    say("  Until one of these returns data there is nothing for the daily", "y")
+    say("  summary to summarise — the pipeline is built and tested, but its", "y")
+    say("  input is empty.", "y")
 
 
 if __name__ == "__main__":
