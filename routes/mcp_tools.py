@@ -1,10 +1,10 @@
 """
 MCP tool definitions and the interactive health-query endpoint.
 
-Exposes the tool schema Claude uses for health queries (services/claude.py)
-for introspection, and /query which runs the full Claude + Google Health
-tool-use loop for a connected user. This is what a future Telegram webhook
-handler calls for the "Interactive Query Pipeline" described in README.md.
+Exposes the tool schema Gemini uses for health queries (services/gemini.py)
+for introspection, and /query which runs the full Gemini + Google Health
+function-calling loop for a connected user. routes/telegram.py calls into
+the same path for the "Interactive Query Pipeline" described in README.md.
 """
 
 import logging
