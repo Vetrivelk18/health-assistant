@@ -64,6 +64,9 @@ def connected_user():
         email=f"telegram_{TEST_CHAT_ID}@local",
         connected=True,
         timezone="UTC",
+        # Due right now: the dispatcher only picks up users whose local
+        # summary hour has come round, and tests don't run at 07:00 UTC.
+        summary_hour=datetime.utcnow().hour,
     )
     db.add(user)
     db.commit()
@@ -132,6 +135,7 @@ def test_user_without_oauth_token_marked_failed():
         google_user_id=f"google_{TEST_CHAT_ID}",
         email=f"telegram_{TEST_CHAT_ID}@local",
         connected=True,
+        summary_hour=datetime.utcnow().hour,
     )
     db.add(user)
     db.commit()
@@ -329,6 +333,7 @@ def test_run_single_user_returns_200_for_permanent_failure():
         google_user_id=f"google_{TEST_CHAT_ID}",
         email=f"telegram_{TEST_CHAT_ID}@local",
         connected=True,
+        summary_hour=datetime.utcnow().hour,
     )
     db.add(user)
     db.commit()
@@ -665,3 +670,27 @@ def test_notification_failure_does_not_change_the_outcome(connected_user):
 
     assert response.status_code == 200
     assert response.json()["status"] == "failed"
+
+
+def test_dispatcher_skips_users_outside_their_delivery_hour(connected_user):
+    """Hourly trigger, per-user hour: a user whose local summary time hasn't
+    come round must not be enqueued."""
+    db = SessionLocal()
+    user = db.query(User).filter(User.id == connected_user).first()
+    # Pick an hour that definitely isn't now.
+    user.summary_hour = (datetime.utcnow().hour + 5) % 24
+    db.commit()
+    db.close()
+
+    with patch(
+        "routes.internal.google_id_token.verify_oauth2_token", return_value=VALID_CLAIMS
+    ), patch(
+        "routes.internal.tasks.is_configured", return_value=True
+    ), patch(
+        "routes.internal.tasks.enqueue", new=AsyncMock()
+    ) as mock_enqueue:
+        response = _post()
+
+    assert response.status_code == 200
+    assert response.json()["skipped"] == [connected_user]
+    mock_enqueue.assert_not_awaited()

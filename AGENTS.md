@@ -62,7 +62,8 @@ function-calling round — harmless, doesn't affect the result, not worth
 chasing.
 
 `routes/telegram.py` (webhook: `/start`, `/connect`, `/disconnect`,
-`/status`, plus plain-text queries routed through `services/gemini.py`) and
+`/status`, `/timezone`, plus plain-text queries routed through
+`services/gemini.py`) and
 `routes/internal.py` (`POST /internal/run-daily` called by Cloud Scheduler,
 which fans out over Cloud Tasks to `POST /internal/run-single-user` —
 see the Gotchas below) are built and wired in. `routes/health.py` (the
@@ -257,6 +258,20 @@ python3 probe_health_api.py
   `google_user_id` and `email` — both UNIQUE columns that previously held
   values synthesized from the Telegram chat id. Adding them to the default
   list alone wasn't enough: an existing `.env` overrides it silently.
+- **Cloud Scheduler fires `/internal/run-daily` HOURLY, not once a day.**
+  Each run dispatches only users whose `summary_hour` matches the current
+  hour *in their own timezone* (`_is_delivery_hour`). A single daily job at a
+  fixed UTC time delivers "good morning" at 12:30 in the afternoon to anyone
+  in IST, and leaves `summary_hour` a column nothing reads. Hourly is free —
+  Cloud Scheduler bills per job, not per invocation. Don't "optimise" this
+  back to daily. Note this means dispatcher tests must set `summary_hour` to
+  the current hour or every user is skipped.
+- **Timezone input is resolved, never guessed** (`utils/timezones.py`).
+  Exact and case-insensitive IANA names resolve, as does an unambiguous bare
+  city ("kolkata"). Anything ambiguous returns *suggestions* instead — there
+  is deliberately no abbreviation table, because "IST" is India, Ireland and
+  Israel, and silently choosing one misplaces every day boundary for that
+  user. Don't add one.
 - **The 7-day refresh-token expiry is a scheduled event, not an edge case**,
   because the consent screen stays in Testing. The daily run therefore
   *notifies* the user (once per `RENAG_AFTER_DAYS`) rather than failing
