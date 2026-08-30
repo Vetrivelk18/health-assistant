@@ -3,9 +3,9 @@ Telegram webhook handler.
 
 Receives Telegram Update objects at POST /webhook/telegram, routes commands
 (/start, /connect, /disconnect, /status) and plain-text questions into the
-existing OAuth (routes/auth.py) and Claude/MCP (routes/mcp_tools.py, services/
-claude.py) pipelines, and replies over the Bot API. This is the "Interactive
-Query Pipeline" entry point described in README.md.
+existing OAuth (routes/auth.py) and Gemini/MCP (routes/mcp_tools.py,
+services/gemini.py) pipelines, and replies over the Bot API. This is the
+"Interactive Query Pipeline" entry point described in README.md.
 """
 
 import logging
