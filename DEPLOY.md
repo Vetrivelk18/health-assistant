@@ -2,11 +2,12 @@
 
 Cloud Run containers don't stay alive between requests, so there's no
 in-process scheduler here. Cloud Scheduler calls `POST /internal/run-daily`
-once a day, which **fans the batch out over Cloud Tasks** — one task per
-user — and returns immediately:
+**hourly**; each run picks up only the users whose own summary hour has come
+round in their own timezone, and **fans those out over Cloud Tasks** — one
+task per user — returning immediately:
 
 ```
-Cloud Scheduler --07:00--> POST /internal/run-daily
+Cloud Scheduler --hourly--> POST /internal/run-daily
                                |  enqueue 1 task per user, respond <1s
                                v
                           Cloud Tasks queue (dispatch capped at 5/sec)
@@ -215,7 +216,7 @@ to trust:
 ```bash
 gcloud scheduler jobs create http health-assistant-daily \
   --location us-central1 \
-  --schedule="0 7 * * *" \
+  --schedule="0 * * * *" \
   --time-zone="UTC" \
   --uri="https://<your-service-url>/internal/run-daily" \
   --http-method=POST \
@@ -237,6 +238,20 @@ service-account email matches exactly — anything else gets a 403.
 `--attempt-deadline` caps at 30 minutes; 180s is far more than needed now
 that this endpoint only enqueues tasks and returns — it does no per-user
 work itself, so its runtime barely moves as users are added.
+
+**The schedule is hourly, not daily, and that's deliberate.** Each run
+dispatches only the users whose own `summary_hour` has just come round in
+their own timezone. A single daily job at a fixed UTC time delivers "good
+morning" at 12:30 in the afternoon to anyone in IST — the summary would
+cover the right day (`_target_day` already handled that) but arrive at the
+wrong hour, and `summary_hour` would stay a column nothing reads.
+
+Hourly costs nothing extra: Cloud Scheduler's free tier is priced per *job*
+(3 free), not per invocation, and 24 dispatcher calls a day is a rounding
+error against Cloud Run's 2M free requests. Most of those 24 runs find no
+users due and return in milliseconds. The run is idempotent — a user already
+summarised today is skipped on `last_summary_sent`, and task names are
+deterministic — so an extra pass can't double-send.
 
 The retry flags bound the *dispatcher's* failures the same way the queue
 bounds the workers'. Cloud Scheduler also defaults to unlimited retries; a
@@ -436,7 +451,7 @@ curl https://<your-service-url>/mcp/tools       # tool schema
 `/health` executes `SELECT 1` against Neon and returns 503 if the database
 is unreachable — worth hitting once after every deploy.
 
-Force a daily run without waiting for 07:00, then watch the fan-out:
+Force a run without waiting for the next hour, then watch the fan-out:
 
 ```bash
 gcloud scheduler jobs run health-assistant-daily --location us-central1

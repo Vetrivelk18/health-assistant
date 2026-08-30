@@ -121,13 +121,32 @@ def verify_task_token(authorization: str = Header(default=None)) -> None:
     _verify_oidc(authorization, settings.TASKS_SERVICE_ACCOUNT_EMAIL)
 
 
+def _user_tz(user: User) -> ZoneInfo:
+    try:
+        return ZoneInfo(user.timezone or "UTC")
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
 def _target_day(user: User) -> date:
     """'Yesterday' in the user's own timezone, not the container's (UTC)."""
-    try:
-        tz = ZoneInfo(user.timezone or "UTC")
-    except ZoneInfoNotFoundError:
-        tz = ZoneInfo("UTC")
-    return (datetime.now(tz) - timedelta(days=1)).date()
+    return (datetime.now(_user_tz(user)) - timedelta(days=1)).date()
+
+
+def _is_delivery_hour(user: User) -> bool:
+    """Whether it's currently this user's chosen summary hour, locally.
+
+    Cloud Scheduler fires this endpoint hourly and each run dispatches only
+    the users whose local hour has come round. That's what makes
+    `summary_hour` mean anything: a single daily job at a fixed UTC time
+    delivers "good morning" at 12:30 in the afternoon to anyone in IST.
+
+    Running hourly costs nothing extra — Cloud Scheduler bills per job, not
+    per invocation, and 24 dispatcher calls a day is a rounding error
+    against Cloud Run's free tier. The run is idempotent (last_summary_sent
+    plus deterministic task names), so an extra pass is harmless.
+    """
+    return datetime.now(_user_tz(user)).hour == (user.summary_hour if user.summary_hour is not None else 7)
 
 
 def _already_summarised(user: User, target_day: date) -> bool:
@@ -227,6 +246,12 @@ async def run_daily(
 
     users = db.query(User).filter(User.connected == True).all()  # noqa: E712
     for user in users:
+        # Hourly trigger, per-user delivery hour: skip anyone whose local
+        # summary time isn't now. See _is_delivery_hour.
+        if not _is_delivery_hour(user):
+            results["skipped"].append(user.id)
+            continue
+
         target_day = _target_day(user)
 
         if _already_summarised(user, target_day):

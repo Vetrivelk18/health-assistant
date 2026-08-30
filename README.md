@@ -1,6 +1,6 @@
 # AI Health Assistant
 
-An intelligent, app-less health assistant that connects your Fitbit or Pixel Watch data (via the Google Health API) with Gemini over Telegram. Get personalized daily health summaries at 7 AM and ask interactive health questions.
+An intelligent, app-less health assistant that connects your Fitbit or Pixel Watch data (via the Google Health API) with Gemini over Telegram. Get personalized daily health summaries each morning in your own timezone, and ask interactive health questions.
 
 > **Status:** OAuth (`routes/auth.py`), the Gemini tool-use query pipeline
 > (`services/gemini.py` + `routes/mcp_tools.py`), the Telegram webhook
@@ -50,7 +50,7 @@ Cloud Scheduler → POST /internal/run-daily (OIDC-authenticated)
 
 ## Features
 
-- **Daily Summaries** (7:00 AM): Personalized health insights from Fitbit data via Gemini, triggered by Cloud Scheduler
+- **Daily Summaries**: Personalized health insights from Fitbit data via Gemini, delivered at your local `summary_hour` (7 AM by default) — set your zone with `/timezone`
 - **Interactive Queries**: Ask questions like "How was my deep sleep?" and get AI-powered answers
 - **OAuth 2.0 Security**: Secure Google Health API integration
 - **Telegram Interface**: No separate app needed
@@ -242,7 +242,7 @@ uvicorn app:app --reload
 
 ### Telegram (built)
 - `POST /webhook/telegram` - Receive Telegram updates. Handles `/start`,
-  `/connect`, `/disconnect`, `/status`, and plain-text health questions
+  `/connect`, `/disconnect`, `/status`, `/timezone`, and plain-text health questions
   (routed through the same Gemini/MCP query pipeline as `/mcp/query`).
 
 ### Internal (built)
@@ -275,7 +275,7 @@ See [`DEPLOY.md`](DEPLOY.md).
 
 ### Receive Daily Summaries
 
-Every day at 7:00 AM (configurable), you'll receive:
+Every morning at 7:00 **your local time** (set with `/timezone`), you'll receive:
 
 ```
 🌅 Good morning! Here's your daily health snapshot:
@@ -320,7 +320,7 @@ docker run -p 8080:8080 --env-file .env -e PORT=8080 health-assistant
 ### Daily Summary Pipeline
 
 ```
-Cloud Scheduler (07:00 in each region's config) → POST /internal/run-daily
+Cloud Scheduler (hourly) → POST /internal/run-daily
        → Verify Google-signed OIDC token (audience + service-account email)
        → For each connected user:
            Skip if already summarised for their "yesterday"
