@@ -30,9 +30,9 @@ An intelligent, app-less health assistant that connects your Fitbit or Pixel Wat
 >
 > **Not yet deployed or run against real infrastructure.** The Cloud Tasks
 > fan-out, retry policies and structured logging are covered by tests
-> (65 passing) but the queue, its IAM bindings and the log-based metric have
-> not been created in a real project — `DEPLOY.md` §5–6 are written, not
-> executed.
+> (129 passing) but the queue, its IAM bindings and the log-based metric
+> have not been created in a real project — `DEPLOY.md` §5–6 are written,
+> not executed.
 
 ## Architecture
 
