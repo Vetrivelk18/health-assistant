@@ -32,8 +32,9 @@ dict) — `tests/test_auth.py` covers the OAuth routes and passes.
 `services/gemini.py` (Gemini function-calling loop) and `routes/mcp_tools.py`
 (`GET /mcp/tools`, `POST /mcp/query`) are built and wired into `app.py`.
 `services/gemini.py` defines one tool, `get_health_metric`, that Gemini calls
-to pull a Fitbit/Pixel Watch metric via `GoogleHealthClient.list_data_points`;
-`tests/test_mcp_tools.py` covers the routes with mocked Gemini/Google calls.
+to pull a Fitbit/Pixel Watch metric via `GoogleHealthClient.fetch_metric`,
+and gets back the condensed digest from `services/health_digest.py`, never
+the raw response; `tests/test_mcp_tools.py` covers the routes with mocked Gemini/Google calls.
 It uses `google-genai` (not the deprecated `google-generativeai`) via the
 async client (`client.aio.models.generate_content`); the system prompt goes
 in `GenerateContentConfig(system_instruction=...)`, not a top-level `system=`
@@ -83,27 +84,41 @@ type, discovered by testing each candidate directly — the Anthropic-style
 "try templates until one works" approach the old `FILTER_TEMPLATES` list
 assumed doesn't hold here, since a template that works for one type 400s on
 another). `list_data_points` applies the right one automatically now — no
-per-call filter setup needed. `total-calories` has none: `list` 400s on it
-unconditionally (`UNSUPPORTED_DATA_TYPE_ACTION` — only `rollup`/
-`dailyRollUp` are supported), which this client doesn't implement; it's left
-in `DATA_TYPES` so it degrades gracefully (`fetch_day` records it under
-`errors`) rather than silently disappearing from the tool schema.
+per-call filter setup needed.
 
-One thing still open: that same probe run returned zero data points for
-every type over a 30-day window against the test account — plumbing (auth,
-scopes, filter grammar) is confirmed correct, but no actual device data has
-been confirmed yet. Re-run `probe_health_api.py` against an account with a
-Fitbit/Pixel Watch that's synced recently before assuming this is a code
-bug.
+**Only sleep uses `list` now.** Real device data (probe runs 2026-10-02/05,
+all 5 types returning data) showed the raw stream is unusable for a summary:
+heart rate is sampled every ~3 s (30k+ points, ~20 MB a day), and steps
+arrive from every connected source — a Fitbit and an iPhone (Apple Health)
+each report the same walk, so summing raw points double-counts. Steps, heart
+rate, active minutes and `total-calories` are read through `dailyRollUp`
+(`ROLLUP_TYPES`, `GoogleHealthClient.daily_rollup`), which returns one
+aggregate per civil day in the user's own timezone and merges sources.
+`total-calories` rejects `list` outright, and `dailyRollUp` rejects sleep,
+whose `list` response already carries Google's per-night summary.
+`fetch_metric` picks the right action per type — call it, not
+`list_data_points`/`daily_rollup` directly.
+
+**Gemini never sees raw responses.** `services/health_digest.py` condenses
+each metric to a small per-day dict (`{"date": ..., "steps": 6686}`), and
+`routes/internal.py` digests the day *after* the outage check and before
+Gemini — the digest (~600 bytes, ~730 tokens per summary) is also what's
+stored in `health_summaries.raw_fitbit_data`. Don't pass raw responses to
+Gemini or the database: one real day is megabytes.
 
 The daily run was reworked on 2026-08-22/23 into a **Cloud Tasks fan-out**
 (`services/tasks.py` + a dispatcher/worker split in `routes/internal.py`),
 with failure classification across every outbound call and structured JSON
 logging (`utils/logging_config.py`). The Gotchas section below covers the
 non-obvious parts — read it before changing `routes/internal.py`,
-`services/tasks.py`, or any error handling. All of it is **test-verified but
-not yet deployed**: the queue, its IAM bindings and the log-based metric in
-`DEPLOY.md` §5–6 have not been created in a real GCP project.
+`services/tasks.py`, or any error handling.
+
+**Deployed 2026-10-05** to project `health-assistant-505718`, region
+`asia-southeast1` (Singapore, next to the Neon database): Cloud Run service
+`health-assistant`, hourly Cloud Scheduler job, Cloud Tasks queue, six
+secrets, Telegram webhook registered. Verified live: `/connect` OAuth,
+interactive queries, and the scheduler's OIDC call to `/internal/run-daily`.
+The log-based metric and alert in `DEPLOY.md` §6 have not been created.
 
 ## Commands
 
@@ -209,8 +224,9 @@ python3 probe_health_api.py
   they logged nothing when Google was down is worse than being late. Don't
   "simplify" this check away; `tests/test_reliability.py` pins the four
   cases (empty-but-OK, all-transient, partial, all-permanent).
-- **`total-calories` is excluded from the outage check** because it fails
-  permanently by design. Counting it would make a real outage undetectable.
+- **Every data type counts toward the outage check, calories included.**
+  Calories used to be excluded because `list` always failed on it; it's read
+  through `dailyRollUp` now and fails only when something is actually wrong.
 - **Structured logs, not f-strings, for anything operational.** Use
   `log_event(logger, level, msg, event=..., user_id=..., ...)` from
   `utils/logging_config.py` — those kwargs become queryable
