@@ -22,23 +22,47 @@ there are, and Cloud Run scales back to zero between dispatches. Every piece
 of this stays inside a free tier at personal scale — see
 [Cost](#9-cost-what-actually-stays-free).
 
+**Current deployment (2026-10-05).** Project `health-assistant-505718`,
+region `asia-southeast1` (Singapore) — chosen to sit next to the Neon
+database (`ap-southeast-1`), since every request makes several database
+round trips. Service URL
+`https://health-assistant-299446589150.asia-southeast1.run.app`; runtime
+service account `health-assistant-run@…`, scheduler/tasks service account
+`health-assistant-scheduler@…`. The commands below use that region; change
+it everywhere at once if you redeploy elsewhere.
+
+Billing must be enabled on the project before any of this — Cloud Run,
+Scheduler, Tasks and Secret Manager refuse to enable without a billing
+account, even at zero usage. A new account usually starts on the 90-day
+Free Trial: **upgrade it to a paid account before the trial ends**, or the
+services stop. The always-free allowances below still apply after upgrading.
+
 ## 1. Neon Postgres
 
 1. Create a project at [neon.tech](https://neon.tech) (free tier is enough
    for personal use).
-2. Copy the connection string from the Neon dashboard. It comes back as
-   plain `postgresql://user:pass@ep-xxxx.neon.tech/dbname` — append
-   `?sslmode=require` (Neon requires TLS):
+2. Copy the connection string from the dashboard's **Connect** button. It
+   already carries `?sslmode=require&channel_binding=require` (Neon requires
+   TLS). Neon offers two hostnames — use each for its job:
 
    ```
-   DATABASE_URL=postgresql://user:pass@ep-xxxx.us-east-2.aws.neon.tech/health_assistant?sslmode=require
+   # pooled (host contains "-pooler") — what the app uses; goes in Secret Manager
+   postgresql://user:pass@ep-xxxx-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+   # direct (same string without "-pooler") — use for migrations
+   postgresql://user:pass@ep-xxxx.c-4.ap-southeast-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
    ```
 
-3. Apply the schema with Alembic, from your machine, before the first deploy:
+3. Apply the schema with Alembic, from your machine, before the first deploy,
+   over the **direct** connection:
 
    ```bash
-   DATABASE_URL="<neon connection string from above>" alembic upgrade head
+   DATABASE_URL="<direct connection string>" alembic upgrade head
+   DATABASE_URL="<direct connection string>" alembic check   # expect "No new upgrade operations"
    ```
+
+   Leave `FASTAPI_ENV` as `development` in your local `.env` while doing
+   this — `config.py` refuses to load in any other mode while `SECRET_KEY` is
+   the development default, which aborts Alembic before it connects.
 
    **If your database already has tables** (created before migrations
    existed, when the app called `create_all()` on boot), don't run the
@@ -113,15 +137,26 @@ openssl rand -hex 32 | tr -d '\n' \
 
 Use `echo -n` / `tr -d '\n'` throughout — a trailing newline becomes part of
 the secret value and produces authentication failures that look like a wrong
-credential.
+credential. `SECRET_KEY` must be a fresh value too
+(`openssl rand -hex 32`) — the app refuses to start in production with the
+development default.
 
-The Cloud Run runtime service account needs read access:
+Run the service as a dedicated service account rather than the default
+compute one (which has project-wide Editor), so it can read exactly these
+secrets and nothing else:
+
+```bash
+gcloud iam service-accounts create health-assistant-run \
+  --display-name="Health Assistant Cloud Run runtime"
+```
+
+It needs read access:
 
 ```bash
 for name in GEMINI_API_KEY GOOGLE_CLIENT_SECRET TELEGRAM_BOT_TOKEN \
             TELEGRAM_WEBHOOK_SECRET DATABASE_URL SECRET_KEY; do
   gcloud secrets add-iam-policy-binding "$name" \
-    --member="serviceAccount:<cloud-run-runtime-sa>@<project-id>.iam.gserviceaccount.com" \
+    --member="serviceAccount:health-assistant-run@<project-id>.iam.gserviceaccount.com" \
     --role="roles/secretmanager.secretAccessor"
 done
 ```
@@ -131,14 +166,15 @@ done
 ```bash
 gcloud run deploy health-assistant \
   --source . \
-  --region us-central1 \
+  --region asia-southeast1 \
+  --service-account health-assistant-run@<project-id>.iam.gserviceaccount.com \
   --allow-unauthenticated \
   --min-instances=0 \
   --max-instances=3 \
   --concurrency=80 \
   --memory=512Mi \
   --cpu=1 \
-  --set-env-vars="FASTAPI_ENV=production,GEMINI_MODEL=gemini-3.5-flash-lite,GOOGLE_REDIRECT_URI=https://<your-service-url>/auth/callback,TELEGRAM_WEBHOOK_URL=https://<your-service-url>/webhook/telegram" \
+  --set-env-vars="FASTAPI_ENV=production,GEMINI_MODEL=gemini-3.5-flash-lite,GOOGLE_CLIENT_ID=<oauth-client-id>,GOOGLE_REDIRECT_URI=https://<your-service-url>/auth/callback,TELEGRAM_WEBHOOK_URL=https://<your-service-url>/webhook/telegram" \
   --set-secrets="GEMINI_API_KEY=GEMINI_API_KEY:latest,GOOGLE_CLIENT_SECRET=GOOGLE_CLIENT_SECRET:latest,TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest,TELEGRAM_WEBHOOK_SECRET=TELEGRAM_WEBHOOK_SECRET:latest,DATABASE_URL=DATABASE_URL:latest,SECRET_KEY=SECRET_KEY:latest"
 ```
 
@@ -204,7 +240,7 @@ gcloud iam service-accounts create health-assistant-scheduler \
   --display-name="Health Assistant daily-run scheduler"
 
 gcloud run services add-iam-policy-binding health-assistant \
-  --region us-central1 \
+  --region asia-southeast1 \
   --member="serviceAccount:health-assistant-scheduler@<project-id>.iam.gserviceaccount.com" \
   --role="roles/run.invoker"
 ```
@@ -215,7 +251,7 @@ to trust:
 
 ```bash
 gcloud scheduler jobs create http health-assistant-daily \
-  --location us-central1 \
+  --location asia-southeast1 \
   --schedule="0 * * * *" \
   --time-zone="UTC" \
   --uri="https://<your-service-url>/internal/run-daily" \
@@ -229,7 +265,7 @@ gcloud scheduler jobs create http health-assistant-daily \
   --max-retry-duration=1800s
 
 gcloud run services update health-assistant \
-  --region us-central1 \
+  --region asia-southeast1 \
   --set-env-vars="RUN_DAILY_AUDIENCE=https://<your-service-url>,SCHEDULER_SERVICE_ACCOUNT_EMAIL=health-assistant-scheduler@<project-id>.iam.gserviceaccount.com"
 ```
 
@@ -273,7 +309,7 @@ than a couple of summaries at once.
 gcloud services enable cloudtasks.googleapis.com
 
 gcloud tasks queues create health-assistant-daily-queue \
-  --location=us-central1 \
+  --location=asia-southeast1 \
   --max-dispatches-per-second=5 \
   --max-concurrent-dispatches=10 \
   --max-attempts=3 \
@@ -309,14 +345,14 @@ when unset. The Cloud Run runtime SA also needs permission to *enqueue*:
 ```bash
 # Let the running service create tasks in the queue.
 gcloud tasks queues add-iam-policy-binding health-assistant-daily-queue \
-  --location=us-central1 \
-  --member="serviceAccount:<cloud-run-runtime-sa>@<project-id>.iam.gserviceaccount.com" \
+  --location=asia-southeast1 \
+  --member="serviceAccount:health-assistant-run@<project-id>.iam.gserviceaccount.com" \
   --role="roles/cloudtasks.enqueuer"
 
 # Let the service account tasks run as mint OIDC tokens for itself.
 gcloud iam service-accounts add-iam-policy-binding \
   health-assistant-scheduler@<project-id>.iam.gserviceaccount.com \
-  --member="serviceAccount:<cloud-run-runtime-sa>@<project-id>.iam.gserviceaccount.com" \
+  --member="serviceAccount:health-assistant-run@<project-id>.iam.gserviceaccount.com" \
   --role="roles/iam.serviceAccountUser"
 ```
 
@@ -324,8 +360,8 @@ Then point the service at the queue:
 
 ```bash
 gcloud run services update health-assistant \
-  --region us-central1 \
-  --set-env-vars="TASKS_QUEUE=health-assistant-daily-queue,TASKS_LOCATION=us-central1,TASKS_TARGET_BASE_URL=https://<your-service-url>"
+  --region asia-southeast1 \
+  --set-env-vars="TASKS_QUEUE=health-assistant-daily-queue,TASKS_LOCATION=asia-southeast1,TASKS_TARGET_BASE_URL=https://<your-service-url>"
 ```
 
 If `TASKS_QUEUE` is unset the app logs a warning and runs the batch inline
@@ -434,12 +470,21 @@ and there's no Logs Explorer to compensate.
 Free tier requires a card on file and Google does not cap spend on its own:
 
 ```bash
+gcloud services enable billingbudgets.googleapis.com
 gcloud billing budgets create \
   --billing-account=<billing-account-id> \
-  --display-name="health-assistant $1 alert" \
-  --budget-amount=1USD \
-  --threshold-rule=percent=1.0
+  --display-name="health-assistant guard" \
+  --budget-amount=100INR \
+  --threshold-rule=percent=0.5 \
+  --threshold-rule=percent=0.9 \
+  --threshold-rule=percent=1.0 \
+  --filter-projects=projects/<project-id>
 ```
+
+The amount must be in the billing account's own currency — a `USD` amount on
+an INR account fails with a bare `INVALID_ARGUMENT`. Check it with
+`gcloud billing accounts describe <billing-account-id> --format="value(currencyCode)"`.
+Do this before enabling anything else.
 
 ## 8. Sanity check
 
@@ -454,8 +499,8 @@ is unreachable — worth hitting once after every deploy.
 Force a run without waiting for the next hour, then watch the fan-out:
 
 ```bash
-gcloud scheduler jobs run health-assistant-daily --location us-central1
-gcloud tasks queues describe health-assistant-daily-queue --location us-central1
+gcloud scheduler jobs run health-assistant-daily --location asia-southeast1
+gcloud tasks queues describe health-assistant-daily-queue --location asia-southeast1
 ```
 
 The `/run-daily` response reports `"mode": "queued"` and lists the user ids
@@ -475,16 +520,23 @@ isn't — the free allowances are orders of magnitude above what this uses.
 | Cloud Tasks | 1,000,000 operations | one per user per day |
 | Cloud Scheduler | 3 jobs | 1 |
 | Neon Postgres | 0.5 GB storage | a few summary rows a day |
-| Gemini API | free tier on flash-lite | 1 summary + ad-hoc queries per user |
+| Gemini API | free tier on flash-lite | ~730 tokens per daily summary (measured) + ad-hoc queries |
 | Telegram Bot API | unlimited, free | — |
-| Secret Manager | 6 active versions, 10k accesses | 5 secrets |
+| Secret Manager | 6 active secret versions in total, 10k accesses | 6 secrets × 1 version — exactly at the limit |
+| Artifact Registry | 0.5 GB storage | one container image per deploy |
 
-The two things that would actually cost money, in order of likelihood:
+The things that would actually cost money, in order of likelihood:
 
 1. **`--min-instances` above 0.** Billed continuously, ~$5–15/month. Never
    set it.
-2. **Secret Manager versions.** Each rotation adds a version; keep at most 6
-   active per secret and destroy old ones (`gcloud secrets versions destroy`).
+2. **Secret Manager versions.** The free allowance is a total across the
+   billing account, not per secret, and this app already uses all 6. A
+   rotation adds a version, so destroy the old one in the same sitting
+   (`gcloud secrets versions destroy <n> --secret=<name>`). Check current
+   pricing — this is the allowance as understood at deploy time.
+3. **Old container images.** Every `gcloud run deploy --source` pushes a new
+   image to the `cloud-run-source-deploy` repository. Delete superseded ones
+   after a deploy to stay under 0.5 GB.
 
 Set the budget alert in step 7 regardless — free tier requires a card on
 file and Google does not cap spend on its own.

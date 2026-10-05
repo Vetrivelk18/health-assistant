@@ -19,20 +19,18 @@ An intelligent, app-less health assistant that connects your Fitbit or Pixel Wat
 > function-calling loop work end-to-end (`gemini-2.5-flash-lite` 404s as "no
 > longer available to new users"; the default is `gemini-3.5-flash-lite`).
 > The `/api/health` endpoints are not built yet — see the project structure
-> below. The Google Health API `filter` grammar is now confirmed against a
-> real account and baked into `FILTER_TEMPLATE_BY_TYPE` — see
-> [Google Health API migration](#google-health-api-migration) — but that same
-> probe run returned zero data points for every type over a 30-day window, so
-> either the connected Google account has no Fitbit/Pixel Watch actively
-> syncing to it, or there's a wearable-linkage step still missing; `calories`
-> is separately and permanently broken via this client (`total-calories` only
-> supports `rollup`/`dailyRollUp`, not `list`).
+> below. All five data types (sleep, steps, heart rate, active minutes,
+> calories) return real device data, confirmed against a real account on
+> 2026-10-05. Gemini is given a ~600-byte per-day digest
+> (`services/health_digest.py`), about 730 tokens per daily summary — see
+> [Google Health API migration](#google-health-api-migration).
 >
-> **Not yet deployed or run against real infrastructure.** The Cloud Tasks
-> fan-out, retry policies and structured logging are covered by tests
-> (129 passing) but the queue, its IAM bindings and the log-based metric
-> have not been created in a real project — `DEPLOY.md` §5–6 are written,
-> not executed.
+> **Deployed** (2026-10-05) to Cloud Run in `asia-southeast1` with Neon
+> Postgres, an hourly Cloud Scheduler job, a Cloud Tasks queue and the
+> Telegram webhook — see [`DEPLOY.md`](DEPLOY.md). Verified live: `/connect`
+> sign-in, interactive questions, and the scheduler's authenticated call to
+> `/internal/run-daily`. 143 tests passing. The log-based metric and alert
+> in `DEPLOY.md` §6 have not been created yet.
 
 ## Architecture
 
@@ -93,6 +91,7 @@ Cloud Scheduler → POST /internal/run-daily (OIDC-authenticated)
 ├── services/                # Business logic
 │   ├── google_health.py     # Google Health API client (built)
 │   ├── gemini.py            # Gemini integration + function-calling loop (built)
+│   ├── health_digest.py     # Condenses Health API responses for Gemini (built)
 │   ├── tasks.py             # Cloud Tasks fan-out for the daily run (built)
 │   └── telegram_bot.py      # Telegram bot helper (built)
 │
@@ -186,15 +185,30 @@ different member path, always prefixed with the type's snake_case name:
 | `steps` | `steps.interval.start_time` |
 | `heart-rate` | `heart_rate.sample_time.physical_time` |
 | `active-minutes` | `active_minutes.interval.start_time` |
-| `total-calories` | none — `list` 400s unconditionally; only `rollup`/`dailyRollUp` are supported, which this client doesn't implement |
+| `total-calories` | none — `list` 400s; only `rollup`/`dailyRollUp` are supported |
 
 `FILTER_TEMPLATE_BY_TYPE` in `services/google_health.py` holds these, and
-`list_data_points` applies the right one automatically — no per-call setup
-needed. What's still open: that same probe run returned zero data points for
-every type over a 30-day window against the connected test account, so the
-plumbing is confirmed correct but real device data hasn't been confirmed yet
-— re-run `probe_health_api.py` against an account with a Fitbit/Pixel Watch
-that's synced recently.
+`list_data_points` applies the right one automatically.
+
+**In practice only sleep is read with `list`.** Real data showed the raw
+points are unusable for a summary: heart rate is sampled every ~3 seconds
+(30,000+ points, ~20 MB a day), and steps arrive from every connected
+source — a watch and a phone each report the same walk, so adding raw points
+double-counts. Steps, heart rate, active minutes and calories are read with
+`dailyRollUp` instead, which returns one total per day (in the user's own
+timezone, sources merged):
+
+| Type | Action | What comes back |
+|---|---|---|
+| `sleep` | `list` | One point per night, including Google's own summary (minutes asleep, per stage) |
+| `steps` | `dailyRollUp` | `countSum` |
+| `heart-rate` | `dailyRollUp` | `beatsPerMinuteAvg` / `Min` / `Max` |
+| `active-minutes` | `dailyRollUp` | minutes per activity level |
+| `total-calories` | `dailyRollUp` | `kcalSum` |
+
+`GoogleHealthClient.fetch_metric` picks the right action per type, and
+`services/health_digest.py` condenses each response into a small per-day
+digest — that, not the raw response, is what Gemini sees and what's stored.
 
 ### 6. Telegram Bot Setup
 
@@ -330,10 +344,12 @@ Cloud Scheduler (hourly) → POST /internal/run-daily
 Cloud Tasks (dispatch capped at 5/sec) → POST /internal/run-single-user
        → Verify OIDC token, re-check last_summary_sent (idempotency)
        → Refresh OAuth token if needed
-       → Fetch sleep/activity/heart rate data for "yesterday" in the
-           user's own timezone (not the container's UTC clock)
-       → Pass to Gemini with system prompt → 3-bullet markdown summary
-       → Upsert the summary row
+       → Fetch sleep/steps/heart rate/active minutes/calories for
+           "yesterday" in the user's own timezone (not the container's
+           UTC clock) — daily rollups, plus sleep's own summary
+       → Condense into a ~600-byte digest (services/health_digest.py)
+       → Pass the digest to Gemini with system prompt → 3-bullet summary
+       → Upsert the summary row (the digest, not the raw response)
        → Send to Telegram (a delivery failure here is logged, not thrown
            away — the stored summary survives it)
        → 200 if done or permanently failed; 503 if worth retrying
@@ -360,7 +376,7 @@ User: "How was my deep sleep?"
        → Gemini identifies it needs sleep data
        → Gemini calls get_health_metric
        → MCP server hits Google Health API
-       → Returns data to Gemini
+       → Returns a per-day digest to Gemini (never the raw response)
        → Gemini synthesizes response
        → Send to Telegram
 ```
