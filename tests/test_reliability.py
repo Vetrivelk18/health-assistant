@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 
 from services.gemini import GeminiError, _wrap_api_error
 from services.google_health import (
+    DATA_TYPES,
     NETWORK_ERROR_STATUS,
     GoogleHealthClient,
     GoogleHealthError,
@@ -90,14 +91,14 @@ def _day(metrics=(), errors=None):
 def test_watch_left_off_is_not_an_outage():
     """Empty-but-successful responses are real data: the user logged nothing.
     That must still produce a summary, not a retry."""
-    day = _day(metrics=("sleep", "steps", "heart_rate", "active_minutes"))
+    day = _day(metrics=tuple(DATA_TYPES))
     assert is_total_outage(day) is False
 
 
 def test_every_type_failing_transiently_is_an_outage():
     errors = {
         m: {"status": 503, "body": "unavailable", "transient": True}
-        for m in ("sleep", "steps", "heart_rate", "active_minutes")
+        for m in DATA_TYPES
     }
     assert is_total_outage(_day(errors=errors)) is True
 
@@ -120,19 +121,22 @@ def test_permanent_failures_everywhere_is_not_a_retryable_outage():
     won't fix it, and it shouldn't look like an outage."""
     errors = {
         m: {"status": 403, "body": "forbidden", "transient": False}
-        for m in ("sleep", "steps", "heart_rate", "active_minutes")
+        for m in DATA_TYPES
     }
     assert is_total_outage(_day(errors=errors)) is False
 
 
-def test_calories_alone_failing_is_ignored():
-    """total-calories fails permanently by design (list is unsupported on
-    it); counting it would make a real outage undetectable."""
-    day = _day(
-        metrics=("sleep", "steps", "heart_rate", "active_minutes"),
-        errors={"calories": {"status": 400, "body": "unsupported", "transient": False}},
-    )
-    assert is_total_outage(day) is False
+def test_calories_counts_toward_an_outage():
+    """Calories is read via dailyRollUp now, so it is an ordinary metric:
+    everything but calories failing is partial data, not an outage."""
+    others_down = {
+        m: {"status": 503, "body": "x", "transient": True}
+        for m in DATA_TYPES if m != "calories"
+    }
+    assert is_total_outage(_day(metrics=("calories",), errors=others_down)) is False
+
+    all_down = {**others_down, "calories": {"status": 503, "body": "x", "transient": True}}
+    assert is_total_outage(_day(errors=all_down)) is True
 
 
 # ------------------------------------------------------------ telegram ----

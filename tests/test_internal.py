@@ -22,6 +22,7 @@ from app import app
 from database import SessionLocal
 from models import HealthSummary, OAuthToken, User
 from services.gemini import GeminiError
+from services.google_health import DATA_TYPES
 from services.telegram_bot import TelegramError
 
 client = TestClient(app)
@@ -422,7 +423,7 @@ def test_total_health_outage_retries_instead_of_sending_empty_summary(connected_
         "metrics": {},
         "errors": {
             m: {"status": 503, "body": "unavailable", "transient": True}
-            for m in ("sleep", "steps", "heart_rate", "active_minutes")
+            for m in DATA_TYPES
         },
     }
 

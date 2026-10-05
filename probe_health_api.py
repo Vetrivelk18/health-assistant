@@ -306,14 +306,16 @@ async def main() -> None:
             end = date.today() - timedelta(days=1)
             start = end - timedelta(days=days - 1)
             try:
-                result = await client.list_data_points(tokens.access_token, path, start, end)
+                # fetch_metric picks list or dailyRollUp per type (calories
+                # is rollup-only).
+                result = await client.fetch_metric(tokens.access_token, friendly, start, end)
             except GoogleHealthError as e:
                 last_error = e
                 note = f"HTTP {e.status}"
                 (FIXTURES / f"{friendly}.error.txt").write_text(e.body)
                 break  # a hard failure won't fix itself with a wider window
 
-            points = result.get("dataPoints", []) or []
+            points = result.get("dataPoints") or result.get("rollupDataPoints") or []
             if points:
                 note = label
                 break
@@ -345,7 +347,7 @@ async def main() -> None:
     if got:
         say(f"\n✓ {len(got)}/{len(rows)} data types returned real data.", "g")
         say("  The fixtures now hold real response shapes — these are what", "g")
-        say("  extract_metrics() and the calories work should be built against.", "g")
+        say("  services/health_digest.py should be checked against.", "g")
         if empty:
             say(f"\n  Still empty: {', '.join(r[0] for r in empty)}", "y")
             say("  Likely genuinely not recorded by the device rather than a bug.", "y")
