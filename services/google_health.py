@@ -24,10 +24,20 @@ name — not its kebab-case URL segment, and not camelCase:
 
 `FILTER_TEMPLATE_BY_TYPE` below holds the confirmed template per type, keyed
 by the kebab-case URL segment. `total-calories` only supports `rollup`/
-`dailyRollUp` actions — `list` 400s on it unconditionally
-(UNSUPPORTED_DATA_TYPE_ACTION) — so it has no filter template and stays
-broken via this client until someone builds the separate rollup request
-shape (a different HTTP method/body, not just a filter).
+`dailyRollUp` — `list` 400s on it (UNSUPPORTED_DATA_TYPE_ACTION).
+
+Daily rollups
+  POST /v4/users/me/dataTypes/{dataType}/dataPoints:dailyRollUp
+  body {"range": {"start": CivilDateTime, "end": CivilDateTime},
+        "windowSizeDays": 1}           (end exclusive, max 14 days)
+Used for every type in ROLLUP_TYPES — see the comment there for why. Each
+rollup point carries a civil day and one aggregate, e.g.
+  steps          {"countSum": "6686"}
+  heart-rate     {"beatsPerMinuteAvg": 73.4, "beatsPerMinuteMax": 143,
+                  "beatsPerMinuteMin": 46}
+  active-minutes {"activeMinutesRollupByActivityLevel":
+                  [{"activityLevel": "LIGHT", "activeMinutesSum": "278"}, …]}
+  total-calories {"kcalSum": 2595.3}
 """
 
 from __future__ import annotations
@@ -70,10 +80,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
 ]
 
-# dataType path segments are kebab-case. "calories" always 400s via this
-# client — total-calories only supports rollup/dailyRollUp, not list. Left
-# in so it degrades gracefully (fetch_day records it under "errors") rather
-# than silently vanishing from the schema.
+# Friendly metric name -> kebab-case dataType path segment.
 DATA_TYPES = {
     "sleep": "sleep",
     "steps": "steps",
@@ -103,6 +110,34 @@ FILTER_TEMPLATE_BY_TYPE: dict[str, str] = {
     "active-minutes": 'active_minutes.interval.start_time >= "{start_rfc}" '
                        'AND active_minutes.interval.start_time < "{end_rfc}"',
 }
+
+
+# Types read through `dailyRollUp` rather than `list`. total-calories rejects
+# `list` outright. The other three are rolled up because the raw stream is
+# unusable for a daily summary: heart rate samples every ~3 s (30k+ points,
+# ~20 MB a day), and steps arrive from every connected device — a Fitbit and
+# an iPhone each report the same walk, so summing raw points double-counts
+# while the rollup merges them. The rollup also buckets by the user's civil
+# day rather than UTC midnight. Confirmed against a real account 2026-10-02.
+# Sleep is the exception: dailyRollUp 400s on it, and its list response
+# already carries Google's own per-night summary.
+ROLLUP_TYPES = {"steps", "heart-rate", "active-minutes", "total-calories"}
+
+# dailyRollUp caps the range per request; 14 days is the limit for
+# total-calories (and the other high-frequency types).
+ROLLUP_MAX_DAYS = 14
+
+# Ceiling on pages followed per list call, so a runaway token chain can't
+# turn one request into hundreds.
+MAX_PAGES = 10
+
+
+def _civil_midnight(day: date) -> dict[str, Any]:
+    """`day` at 00:00 as the API's CivilDateTime."""
+    return {
+        "date": {"year": day.year, "month": day.month, "day": day.day},
+        "time": {"hours": 0, "minutes": 0, "seconds": 0, "nanos": 0},
+    }
 
 
 # Status code used for "the request never got a response at all" — a DNS
@@ -273,8 +308,16 @@ class GoogleHealthClient:
         *,
         filter_template: str | None = None,
         page_size: int | None = None,
+        max_pages: int = MAX_PAGES,
     ) -> dict[str, Any]:
-        """One page of data points for a kebab-case dataType over [start, end]."""
+        """Data points for a kebab-case dataType over [start, end].
+
+        Follows `nextPageToken` up to `max_pages`: a watch that samples heart
+        rate more than once a minute overflows the 1440-point page, and stats
+        computed from the first page alone would silently cover only part of
+        the day. If the cap is hit the last token is left in the result, so a
+        truncated fetch stays distinguishable from a complete one.
+        """
         url = f"{HEALTH_BASE}/users/me/dataTypes/{data_type}/dataPoints"
 
         params: dict[str, Any] = {
@@ -293,20 +336,88 @@ class GoogleHealthClient:
                 end_rfc=f"{(end + timedelta(days=1)).isoformat()}T00:00:00Z",
             )
 
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as c:
-                r = await c.get(url, params=params,
-                                headers={"Authorization": f"Bearer {access_token}"})
-        except httpx.HTTPError as e:
-            # A timeout or connection reset otherwise escapes as a raw httpx
-            # exception, past every `except GoogleHealthError` in the app.
-            raise GoogleHealthError(
-                NETWORK_ERROR_STATUS, f"{type(e).__name__}: {e}", url
-            ) from e
+        result: dict[str, Any] = {}
+        points: list[Any] = []
+        for _ in range(max(1, max_pages)):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as c:
+                    r = await c.get(url, params=params,
+                                    headers={"Authorization": f"Bearer {access_token}"})
+            except httpx.HTTPError as e:
+                # A timeout or connection reset otherwise escapes as a raw httpx
+                # exception, past every `except GoogleHealthError` in the app.
+                raise GoogleHealthError(
+                    NETWORK_ERROR_STATUS, f"{type(e).__name__}: {e}", url
+                ) from e
 
-        if r.status_code >= 400:
-            raise GoogleHealthError(r.status_code, r.text, str(r.request.url))
-        return r.json()
+            if r.status_code >= 400:
+                raise GoogleHealthError(r.status_code, r.text, str(r.request.url))
+
+            result = r.json()
+            points.extend(result.get("dataPoints") or [])
+            token = result.get("nextPageToken")
+            if not token:
+                break
+            params["pageToken"] = token
+
+        if "dataPoints" in result or points:
+            result["dataPoints"] = points
+        return result
+
+    async def daily_rollup(
+        self,
+        access_token: str,
+        data_type: str,
+        start: date,
+        end: date,
+    ) -> dict[str, Any]:
+        """One rolled-up data point per civil day over [start, end].
+
+        The API caps the range per request (ROLLUP_MAX_DAYS), so a longer
+        span is fetched in chunks and the points concatenated.
+        """
+        url = f"{HEALTH_BASE}/users/me/dataTypes/{data_type}/dataPoints:dailyRollUp"
+
+        points: list[Any] = []
+        chunk_start = start
+        while chunk_start <= end:
+            chunk_end = min(end, chunk_start + timedelta(days=ROLLUP_MAX_DAYS - 1))
+            # The range is closed-open, so the end is the day *after* the
+            # last day wanted.
+            after = chunk_end + timedelta(days=1)
+            body = {
+                "range": {
+                    "start": _civil_midnight(chunk_start),
+                    "end": _civil_midnight(after),
+                },
+                "windowSizeDays": 1,
+            }
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as c:
+                    r = await c.post(url, json=body,
+                                     headers={"Authorization": f"Bearer {access_token}"})
+            except httpx.HTTPError as e:
+                raise GoogleHealthError(
+                    NETWORK_ERROR_STATUS, f"{type(e).__name__}: {e}", url
+                ) from e
+
+            if r.status_code >= 400:
+                raise GoogleHealthError(r.status_code, r.text, url)
+
+            points.extend(r.json().get("rollupDataPoints") or [])
+            chunk_start = after
+
+        return {"rollupDataPoints": points}
+
+    async def fetch_metric(
+        self, access_token: str, friendly: str, start: date, end: date
+    ) -> dict[str, Any]:
+        """Raw response for one friendly metric name, via `dailyRollUp` or
+        `list` as ROLLUP_TYPES dictates."""
+        path = DATA_TYPES[friendly]
+        if path in ROLLUP_TYPES:
+            return await self.daily_rollup(access_token, path, start, end)
+        return await self.list_data_points(access_token, path, start, end)
 
     async def fetch_day(self, access_token: str, day: date) -> dict[str, Any]:
         """
@@ -319,10 +430,10 @@ class GoogleHealthClient:
         """
         out: dict[str, Any] = {"date": day.isoformat(), "metrics": {}, "errors": {}}
 
-        for friendly, path in DATA_TYPES.items():
+        for friendly in DATA_TYPES:
             try:
-                out["metrics"][friendly] = await self.list_data_points(
-                    access_token, path, day, day
+                out["metrics"][friendly] = await self.fetch_metric(
+                    access_token, friendly, day, day
                 )
             except GoogleHealthError as e:
                 logger.warning("fetch %s failed: %s", friendly, e)
@@ -346,14 +457,11 @@ def is_total_outage(day_data: dict[str, Any]) -> bool:
     the user something false about their own health, so the caller should
     retry instead.
 
-    `total-calories` is excluded: it fails permanently by design (list isn't
-    supported on it), so counting it would make a total outage impossible to
-    detect.
+    Every type counts, calories included — it used to be excluded because
+    `list` always failed on it, but it is now read through dailyRollUp.
     """
     errors = day_data.get("errors", {})
-    retryable = {k: v for k, v in errors.items() if k != "calories"}
-    expected = {k for k in DATA_TYPES if k != "calories"}
 
-    if set(retryable) != expected:
+    if set(errors) != set(DATA_TYPES):
         return False  # at least one type came back — partial data is usable
-    return any(e.get("transient") for e in retryable.values())
+    return any(e.get("transient") for e in errors.values())

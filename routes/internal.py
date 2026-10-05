@@ -58,6 +58,7 @@ from routes.telegram import telegram_client
 from services import gemini, tasks
 from services.gemini import GeminiError
 from services.google_health import GoogleHealthError, is_total_outage
+from services.health_digest import digest_day
 from services.telegram_bot import TelegramError
 from utils.logging_config import log_event
 
@@ -394,6 +395,11 @@ async def _summarise_user(user: User, target_day: date, db: Session) -> dict:
         log_event(logger, logging.WARNING, f"Partial health data for {user.id}",
                   event="health_partial", user_id=user.id,
                   missing=sorted(day_data["errors"]))
+
+    # Gemini and the stored row both get the digest, not Google's raw
+    # response: the raw day runs to megabytes (heart rate alone), which
+    # would blow the free-tier token budget and fill the database.
+    day_data = digest_day(day_data)
 
     try:
         summary_text = await gemini.generate_daily_summary(day_data)

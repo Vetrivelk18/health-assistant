@@ -3,9 +3,9 @@ Gemini AI integration.
 
 Two entry points:
   generate_daily_summary(day_data)
-      One-shot: turn a day of Google Health metrics (the dict returned by
-      GoogleHealthClient.fetch_day) into a short markdown summary. No tool
-      use — the data is already in hand.
+      One-shot: turn a day of Google Health metrics (fetch_day's output,
+      condensed by health_digest.digest_day) into a short markdown summary.
+      No tool use — the data is already in hand.
 
   answer_health_query(user_message, access_token, health_client)
       Interactive: Gemini decides which metrics (if any) it needs and calls
@@ -32,6 +32,7 @@ from google.genai import types
 
 from config import settings
 from services.google_health import DATA_TYPES, GoogleHealthClient, GoogleHealthError
+from services.health_digest import digest_metric
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,13 @@ DAILY_SUMMARY_SYSTEM_PROMPT = """\
 You are a friendly, encouraging health assistant. You'll be given one day's \
 Fitbit/Pixel Watch metrics as JSON. Write a short daily summary as up to 3 \
 markdown bullet points covering sleep, activity, and heart rate.
+
+The data is already summarised per day: sleep (bedtime and wake time in the \
+user's local time, minutes asleep, minutes per stage), steps (daily total), \
+active_minutes (total and per intensity level), heart_rate (average, min and \
+max bpm for the day) and calories (kcal burned). The data covers yesterday, \
+so write about "yesterday", not "today". min_bpm is the lowest reading of \
+the day, not a resting heart rate — don't call it resting.
 
 Rules:
 - Only report numbers that are actually present in the data — never invent
@@ -153,7 +161,8 @@ async def generate_daily_summary(day_data: dict[str, Any]) -> str:
     try:
         response = await _require_client().aio.models.generate_content(
             model=settings.GEMINI_MODEL,
-            contents=f"Today's health data:\n\n{json.dumps(day_data, indent=2)}",
+            contents=f"Yesterday's health data ({day_data.get('date')}):\n\n"
+                     f"{json.dumps(day_data, indent=2)}",
             config=types.GenerateContentConfig(
                 system_instruction=DAILY_SUMMARY_SYSTEM_PROMPT,
                 max_output_tokens=MAX_TOKENS,
@@ -239,7 +248,7 @@ async def _run_tool(
         return {"content": f"Invalid date: {e}", "is_error": True}
 
     try:
-        result = await health_client.list_data_points(access_token, DATA_TYPES[metric], start, end)
+        result = await health_client.fetch_metric(access_token, metric, start, end)
     except GoogleHealthError as e:
         logger.warning("get_health_metric(%s) failed: %s", metric, e)
         return {
@@ -247,7 +256,8 @@ async def _run_tool(
             "is_error": True,
         }
 
-    return {"content": json.dumps(result), "is_error": False}
+    # The digest, not the raw response — see services/health_digest.py.
+    return {"content": json.dumps(digest_metric(metric, result)), "is_error": False}
 
 
 def _parse_date(value: str | None) -> date | None:
