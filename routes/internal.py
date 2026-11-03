@@ -41,7 +41,7 @@ to running the batch inline, so the endpoint still works end to end.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -151,7 +151,21 @@ def _is_delivery_hour(user: User) -> bool:
 
 
 def _already_summarised(user: User, target_day: date) -> bool:
-    return bool(user.last_summary_sent and user.last_summary_sent.date() >= target_day)
+    """Whether the summary covering `target_day` has already gone out.
+
+    `target_day` is the day being summarised — yesterday — while
+    `last_summary_sent` is when the send happened, which is the day *after*
+    the one it covered. So the send date has to be strictly later than
+    `target_day`: comparing with >= matched yesterday's send against today's
+    target and skipped every second day.
+
+    The send time is stored as naive UTC and is converted to the user's
+    timezone first, since `target_day` is a date in that timezone.
+    """
+    if not user.last_summary_sent:
+        return False
+    sent_local = user.last_summary_sent.replace(tzinfo=timezone.utc).astimezone(_user_tz(user))
+    return sent_local.date() > target_day
 
 
 # While the OAuth consent screen is in Testing, Google expires refresh

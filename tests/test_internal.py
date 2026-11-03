@@ -221,6 +221,44 @@ def test_already_sent_today_is_skipped(connected_user):
     assert response.json()["skipped"] == [connected_user]
 
 
+def test_sent_yesterday_is_sent_again_today(connected_user):
+    """Bug fix: yesterday's send must not count as today's. The check used to
+    compare the send date against the day being summarised (always one day
+    earlier), so every second day was skipped as "already summarised"."""
+    db = SessionLocal()
+    user = db.query(User).filter(User.id == connected_user).first()
+    user.last_summary_sent = datetime.utcnow() - timedelta(days=1)
+    db.commit()
+    db.close()
+
+    fetch, summarise, send = _health_and_gemini_patches()
+    with patch(
+        "routes.internal.google_id_token.verify_oauth2_token", return_value=VALID_CLAIMS
+    ), fetch, summarise, send as mock_send:
+        response = _post()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["sent"] == [connected_user]
+    assert body["skipped"] == []
+    mock_send.assert_awaited_once()
+
+
+def test_already_summarised_uses_the_users_local_date():
+    """The send time is stored in UTC but the target day is local. 20:00 UTC
+    on the 8th is already the 9th in Kolkata, so it covers a target of the
+    8th there — and doesn't for someone on UTC."""
+    sent_at = datetime(2026, 10, 8, 20, 0)
+    target = date(2026, 10, 8)
+
+    kolkata = User(timezone="Asia/Kolkata", last_summary_sent=sent_at)
+    utc = User(timezone="UTC", last_summary_sent=sent_at)
+
+    assert internal_module._already_summarised(kolkata, target) is True
+    assert internal_module._already_summarised(utc, target) is False
+    assert internal_module._already_summarised(User(timezone="UTC"), target) is False
+
+
 # ----------------------------------------------------- Cloud Tasks fan-out ----
 
 def _health_and_gemini_patches():
